@@ -29,9 +29,12 @@ npm run build   # tsc --noEmit && vite build
 
 ## Known limits
 
-- The Protomaps basemap is **hotlinked from their daily build**, which their docs
-  advise against for anything but testing. For real use, copy a `.pmtiles` extract
-  to your own storage and change `BUCKET` in `src/map.ts`.
+- The basemap is hotlinked from Protomaps' **Source Cooperative mirror**. It has to
+  be that mirror: `build.protomaps.com` only sends `access-control-allow-origin` for
+  localhost, so it works in dev and fails silently once deployed. The mirror is a
+  plain S3 bucket with no CDN, so first tiles take a second or two. For real use,
+  extract a regional `.pmtiles` to your own storage and change `BASEMAP` in
+  `src/map.ts`.
 - Snapshot years are sparse and irregular, so the crossfade reads as a dissolve
   rather than borders morphing. Fixing that means CShapes 2.0 (which has real
   start/end dates) plus deck.gl's `DataFilterExtension`.

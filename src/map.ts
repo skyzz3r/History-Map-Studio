@@ -5,11 +5,13 @@ import { MapboxOverlay } from "@deck.gl/mapbox";
 import { GeoJsonLayer } from "deck.gl";
 import { hueFor } from "./borders.ts";
 
-// Protomaps builds are dated and rotate out, so read the current one rather than
-// pinning a filename that dies in a few weeks. The planet is ~137GB — we only ever
-// pull the byte ranges for visible tiles.
-const BUILDS = "https://build-metadata.protomaps.dev/builds.json";
-const BUCKET = "https://build.protomaps.com";
+// Source Cooperative's mirror of the Protomaps planet, NOT build.protomaps.com.
+// The build bucket only sends access-control-allow-origin for localhost origins, so
+// it works in dev and silently fails the moment the site is deployed. This mirror
+// sends `*`, and its URL is stable rather than dated. ~135GB, but range requests
+// mean we only ever pull the bytes for visible tiles.
+const BASEMAP =
+  "pmtiles://https://data.source.coop/protomaps/openstreetmap/v4.pmtiles";
 
 // The basemap is a backdrop for historical borders, so drop everything modern:
 // roads, buildings, POIs, and — critically — present-day country boundaries and
@@ -28,14 +30,15 @@ export async function initMap(
 ): Promise<maplibregl.Map> {
   maplibregl.addProtocol("pmtiles", new Protocol().tile);
 
-  const builds: { key: string }[] = await (await fetch(BUILDS)).json();
-  const url = `pmtiles://${BUCKET}/${builds[builds.length - 1].key}`;
-
   const style: StyleSpecification = {
     version: 8,
     glyphs: "https://protomaps.github.io/basemaps-assets/fonts/{fontstack}/{range}.pbf",
     sources: {
-      protomaps: { type: "vector", url, attribution: "© OpenStreetMap, Protomaps" },
+      protomaps: {
+        type: "vector",
+        url: BASEMAP,
+        attribution: "© OpenStreetMap, Protomaps",
+      },
     },
     layers: layers("protomaps", namedFlavor("dark"), { lang: "en" }).filter(
       (l) => !CLUTTER.test(l.id),
