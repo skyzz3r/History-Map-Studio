@@ -49,7 +49,8 @@ export default function App() {
 
   return (
     <div className="relative h-dvh w-dvw overflow-hidden bg-neutral-950 text-neutral-100">
-      <div ref={container} className="absolute inset-0" />
+      {/* Sized by #map in index.css, not Tailwind — see the comment there. */}
+      <div ref={container} id="map" />
 
       <header className="pointer-events-none absolute inset-x-0 top-0 flex items-center gap-3 p-4">
         <h1 className="pointer-events-auto rounded-lg bg-neutral-900/80 px-3 py-1.5 text-sm font-medium tracking-tight backdrop-blur">

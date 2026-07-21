@@ -9,6 +9,16 @@ body,
   color-scheme: dark;
 }
 
+/* Sizing the map container MUST live here, not in a Tailwind class.
+   MapLibre ships `.maplibregl-map { position: relative }` in an unlayered
+   stylesheet, and unlayered CSS beats anything in @layer regardless of import
+   order — so Tailwind's `absolute` silently loses and the container collapses to
+   zero height. This rule is unlayered too, and later, so it wins. */
+#map {
+  position: absolute;
+  inset: 0;
+}
+
 /* Era ticks from <datalist> would otherwise render as visible text in Chrome. */
 datalist {
   display: none;
