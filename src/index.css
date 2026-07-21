@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: #0a0a0a;
+  color-scheme: dark;
+}
+
+/* Era ticks from <datalist> would otherwise render as visible text in Chrome. */
+datalist {
+  display: none;
+}
+
+.maplibregl-ctrl-attrib {
+  font-size: 10px;
+  background: rgb(23 23 23 / 0.8) !important;
+}
+.maplibregl-ctrl-attrib a {
+  color: #a3a3a3;
+}
