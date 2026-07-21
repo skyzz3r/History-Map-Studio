@@ -2,8 +2,8 @@ import maplibregl, { type StyleSpecification } from "maplibre-gl";
 import { Protocol } from "pmtiles";
 import { layers, namedFlavor } from "@protomaps/basemaps";
 import { MapboxOverlay } from "@deck.gl/mapbox";
-import { GeoJsonLayer } from "deck.gl";
-import { hueFor } from "./borders.ts";
+import { GeoJsonLayer, TextLayer } from "deck.gl";
+import { hueFor, labelsFor, type Label } from "./borders.ts";
 
 // Source Cooperative's mirror of the Protomaps planet, NOT build.protomaps.com.
 // The build bucket only sends access-control-allow-origin for localhost origins, so
@@ -33,6 +33,9 @@ export async function initMap(
   const style: StyleSpecification = {
     version: 8,
     glyphs: "https://protomaps.github.io/basemaps-assets/fonts/{fontstack}/{range}.pbf",
+    // Without this the place layers ask for icons that do not exist and MapLibre
+    // logs "Image townspot could not be loaded" on every tile.
+    sprite: "https://protomaps.github.io/basemaps-assets/sprites/v4/dark",
     sources: {
       protomaps: {
         type: "vector",
@@ -68,19 +71,25 @@ export async function initMap(
     onPick(p ? { name: p.NAME, subjectTo: p.SUBJECTO, partOf: p.PARTOF } : null);
   });
 
+  // Which labels are worth drawing depends on zoom, so rebuild on zoom, not just
+  // on scrub. Cheap: the snapshot data is unchanged, deck reuses its buffers.
+  map.on("zoomend", () => last && setBorders(...last));
+
   new ResizeObserver(() => map.resize()).observe(container);
   return map;
 }
 
+type Side = { index: number; data: unknown } | null;
+let last: [Side, Side, number] | null = null;
+
 /** Two stacked snapshots crossfading by `t`. Called at scrub rate — must stay cheap. */
-export function setBorders(
-  a: { index: number; data: unknown } | null,
-  b: { index: number; data: unknown } | null,
-  t: number,
-) {
+export function setBorders(a: Side, b: Side, t: number) {
+  last = [a, b, t];
+  const front = t < 0.5 ? a : b;
   const built = [
     a && border(a.index, a.data, 1 - t, t < 0.5),
     b && b.index !== a?.index ? border(b.index, b.data, t, t >= 0.5) : null,
+    front && names(front.index, front.data),
   ].filter(Boolean);
   if (!built.length) return;
 
@@ -119,16 +128,96 @@ function border(index: number, data: unknown, opacity: number, pickable: boolean
   });
 }
 
-export function exportPng() {
+const labelCache = new Map<number, Label[]>();
+
+/**
+ * Always-on country names. Anything whose on-screen footprint is under ~40px gets
+ * dropped, which is what keeps 254 labels from becoming a smear at world zoom and
+ * reveals the small polities as you go in.
+ */
+function names(index: number, data: unknown) {
+  let all = labelCache.get(index);
+  if (!all) labelCache.set(index, (all = labelsFor(data)));
+
+  // A ring's area is in square degrees; degrees-per-pixel falls off as 2^zoom.
+  // Roughly: how many pixels wide is this country right now?
+  const perPx = 360 / (512 * Math.pow(2, map.getZoom()));
+  const visible = all.filter((l) => Math.sqrt(l.area) / perPx > 70);
+
+  return new TextLayer<Label>({
+    id: `names-${index}`,
+    data: visible,
+    getPosition: (l) => l.at,
+    getText: (l) => l.name,
+    getSize: 13,
+    getColor: [255, 255, 255, 240],
+    outlineColor: [0, 0, 0, 255],
+    outlineWidth: 3,
+    fontSettings: { sdf: true },
+    getTextAnchor: "middle",
+    getAlignmentBaseline: "center",
+    // No maxWidth: deck.gl measures it in PIXELS, not ems, so a small number
+    // wraps every label into an unreadable sliver.
+  });
+}
+
+function download(blob: Blob, ext: string) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `historical-map-${Date.now()}.${ext}`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/**
+ * PNG at `width` px across (default 4K), by temporarily raising the device pixel
+ * ratio so the GL drawing buffer itself is that big — scaling the small canvas up
+ * afterwards would just be a blurry upscale.
+ */
+export function exportPng(width = 3840) {
+  const canvas = map.getCanvas();
+  const before = map.getPixelRatio();
+  map.setPixelRatio(width / canvas.clientWidth);
   map.once("render", () => {
-    map.getCanvas().toBlob((blob) => {
-      if (!blob) return;
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `historical-map-${Date.now()}.png`;
-      a.click();
-      URL.revokeObjectURL(a.href);
+    canvas.toBlob((b) => {
+      if (b) download(b, "png");
+      map.setPixelRatio(before);
     });
   });
   map.triggerRepaint();
+}
+
+/**
+ * Records the live canvas. MediaRecorder emits real MP4/H.264 in current Chrome,
+ * so there is no ffmpeg.wasm here; browsers without it fall back to WebM, which
+ * every video editor still reads.
+ */
+export function startRecording(fps = 30) {
+  const mime =
+    [
+      "video/mp4;codecs=avc1.42E01E",
+      "video/mp4",
+      "video/webm;codecs=vp9",
+      "video/webm",
+    ].find((m) => MediaRecorder.isTypeSupported(m)) ?? "";
+
+  const stream = map.getCanvas().captureStream(fps);
+  const chunks: Blob[] = [];
+  const rec = new MediaRecorder(stream, {
+    mimeType: mime,
+    videoBitsPerSecond: 16e6,
+  });
+  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  rec.start();
+
+  return () =>
+    new Promise<string>((done) => {
+      rec.onstop = () => {
+        const ext = mime.startsWith("video/mp4") ? "mp4" : "webm";
+        download(new Blob(chunks, { type: mime }), ext);
+        stream.getTracks().forEach((t) => t.stop());
+        done(ext);
+      };
+      rec.stop();
+    });
 }

@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { lerpBearing, sampleCamera, type Key } from "./keyframes.ts";
 import { activeAt, wdYear } from "./wikidata.ts";
+import { labelsFor } from "./borders.ts";
 
 // --- lerpBearing: must take the short way round ---
 assert.equal(lerpBearing(0, 90, 0.5), 45);
@@ -20,21 +21,19 @@ assert.equal(wdYear(undefined), null);
 assert.equal(wdYear("garbage"), null);
 
 // --- activeAt: a dated property that misses the year must yield NOTHING ---
+const t = (y: number) => ({
+  value: { content: { time: `+${String(y).padStart(4, "0")}-01-01T00:00:00Z` } },
+});
 const claim = (id: string, start?: number, end?: number) => ({
-  mainsnak: { datavalue: { value: { id } } },
-  qualifiers: {
-    ...(start !== undefined && {
-      P580: [{ datavalue: { value: { time: `+${String(start).padStart(4, "0")}-01-01T00:00:00Z` } } }],
-    }),
-    ...(end !== undefined && {
-      P582: [{ datavalue: { value: { time: `+${String(end).padStart(4, "0")}-01-01T00:00:00Z` } } }],
-    }),
-  },
+  value: { content: id },
+  qualifiers: [
+    ...(start === undefined ? [] : [{ property: { id: "P580" }, ...t(start) }]),
+    ...(end === undefined ? [] : [{ property: { id: "P582" }, ...t(end) }]),
+  ],
 });
 const presidents = [claim("deGaulle", 1959, 1969), claim("macron", 2017)];
 
-const idOf = (claims: ReturnType<typeof activeAt>) =>
-  (claims[0]?.mainsnak?.datavalue?.value as { id?: string } | undefined)?.id;
+const idOf = (s: ReturnType<typeof activeAt>) => s[0]?.value?.content;
 
 assert.equal(idOf(activeAt(presidents, 1960)), "deGaulle");
 assert.equal(idOf(activeAt(presidents, 2020)), "macron");
@@ -61,5 +60,40 @@ assert.ok(sampleCamera(keys, 0.5)!.lng < 25, "ease-in starts slow");
 
 // unsorted input must not break bracketing
 assert.equal(sampleCamera([k(4, 200), k(0, 0), k(2, 100)], 3)?.lng, 150);
+
+// --- labelsFor: anchor must land on the BIGGEST landmass, not the average ---
+// A USA-shaped feature: a small Alaska box far west, a large mainland box east.
+// Averaging both would drop the label in the Pacific between them.
+const usa = {
+  features: [
+    {
+      properties: { NAME: "USA" },
+      geometry: {
+        type: "MultiPolygon",
+        coordinates: [
+          [[[-160, 60], [-150, 60], [-150, 70], [-160, 70], [-160, 60]]], // Alaska
+          [[[-100, 30], [-80, 30], [-80, 45], [-100, 45], [-100, 30]]], // mainland
+        ],
+      },
+    },
+  ],
+};
+const [label] = labelsFor(usa);
+assert.equal(label.name, "USA");
+assert.ok(label.at[0] > -95 && label.at[0] < -85, `lng on mainland, got ${label.at[0]}`);
+assert.ok(label.at[1] > 35 && label.at[1] < 40, `lat on mainland, got ${label.at[1]}`);
+assert.equal(Math.round(label.area), 300, "area of the larger 20x15 box");
+
+// degenerate ring (this dataset really does contain 4-vertex countries)
+const flat = {
+  features: [
+    {
+      properties: { NAME: "Flat" },
+      geometry: { type: "Polygon", coordinates: [[[5, 5], [6, 5], [7, 5], [5, 5]]] },
+    },
+  ],
+};
+assert.deepEqual(labelsFor(flat)[0].at, [5, 5], "zero area falls back, never NaN");
+assert.deepEqual(labelsFor({ features: [] }), []);
 
 console.log("ok");

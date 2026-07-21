@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { exportPng, map } from "../map.ts";
+import { exportPng, map, startRecording } from "../map.ts";
 import { applyIndex, getIndex } from "../scrub.ts";
-import { duration, play, type Key } from "../keyframes.ts";
+import { duration, play, type Camera, type Key } from "../keyframes.ts";
 import { formatYear, yearAt } from "../borders.ts";
 
 export default function StudioBar({
@@ -14,9 +14,33 @@ export default function StudioBar({
   max: number;
 }) {
   const [playing, setPlaying] = useState(false);
+  const [recording, setRecording] = useState(false);
   const stop = useRef<(() => void) | null>(null);
 
   useEffect(() => () => stop.current?.(), []);
+
+  const tick = (cam: Camera) => {
+    map.jumpTo({
+      center: [cam.lng, cam.lat],
+      zoom: cam.zoom,
+      pitch: cam.pitch,
+      bearing: cam.bearing,
+    });
+    applyIndex(Math.min(cam.index, max), true); // time-travel is keyframed too
+  };
+
+  // Recording just runs the sequence with the canvas wired to a MediaRecorder,
+  // so whatever plays back is exactly what lands in the file.
+  const record = () => {
+    if (keys.length < 2 || recording) return;
+    setRecording(true);
+    const finish = startRecording();
+    setPlaying(true);
+    stop.current = play(keys, tick, () => {
+      setPlaying(false);
+      finish().then(() => setRecording(false));
+    });
+  };
 
   const capture = () => {
     const c = map.getCenter();
@@ -41,19 +65,7 @@ export default function StudioBar({
     }
     if (keys.length < 2) return;
     setPlaying(true);
-    stop.current = play(
-      keys,
-      (cam) => {
-        map.jumpTo({
-          center: [cam.lng, cam.lat],
-          zoom: cam.zoom,
-          pitch: cam.pitch,
-          bearing: cam.bearing,
-        });
-        applyIndex(Math.min(cam.index, max), true); // time-travel is keyframed too
-      },
-      () => setPlaying(false),
-    );
+    stop.current = play(keys, tick, () => setPlaying(false));
   };
 
   return (
@@ -73,10 +85,17 @@ export default function StudioBar({
           {playing ? "Stop" : "Play sequence"}
         </button>
         <button
-          onClick={exportPng}
+          onClick={() => exportPng()}
           className="rounded-lg bg-neutral-800 px-3 py-1.5 text-sm"
         >
-          Export PNG
+          Export 4K PNG
+        </button>
+        <button
+          onClick={record}
+          disabled={keys.length < 2 || recording || playing}
+          className="rounded-lg bg-neutral-800 px-3 py-1.5 text-sm text-red-300 disabled:opacity-30"
+        >
+          {recording ? "Recording…" : "Record video"}
         </button>
         <button
           onClick={() => setKeys([])}
