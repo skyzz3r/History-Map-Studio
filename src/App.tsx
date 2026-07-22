@@ -2,11 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import { loadIndex, yearAt } from "./borders.ts";
 import { initMap, type Picked } from "./map.ts";
 import { applyIndex, getIndex } from "./scrub.ts";
-import { lookup, type Info } from "./wikidata.ts";
+import { lookup, lookupByQid, type Info } from "./wikidata.ts";
+import { cachedTags, enTitleOf, fetchTags, qidOf } from "./ohm.ts";
 import type { Key } from "./keyframes.ts";
 import Timeline from "./components/Timeline.tsx";
 import SideSheet from "./components/SideSheet.tsx";
 import StudioBar from "./components/StudioBar.tsx";
+import MapControls from "./components/MapControls.tsx";
 
 export default function App() {
   const container = useRef<HTMLDivElement>(null);
@@ -36,12 +38,26 @@ export default function App() {
     };
   }, []);
 
-  // Entity lookup is keyed to the polygon AND the year on screen when it was clicked.
+  // Entity lookup is keyed to the polygon AND the year on screen when it was
+  // clicked. The clicked OHM feature has a `wikidata` tag ~90% of the time, so
+  // ask Overpass for it and resolve the exact Q-id; searching by name is only
+  // the fallback, and searching by name is what used to return the wrong
+  // country and the wrong century.
   useEffect(() => {
     setInfo(null);
     if (!picked?.name) return;
     let stale = false;
-    lookup(picked.name, yearAt(getIndex())).then((i) => !stale && setInfo(i));
+    (async () => {
+      const year = yearAt(getIndex());
+      await fetchTags([picked.osmId]);
+      if (stale) return;
+      const tags = cachedTags(picked.osmId);
+      const qid = qidOf(tags);
+      const i = qid
+        ? await lookupByQid(qid, year, picked.name, enTitleOf(tags))
+        : await lookup(picked.name, year);
+      if (!stale) setInfo(i);
+    })();
     return () => {
       stale = true;
     };
@@ -67,6 +83,9 @@ export default function App() {
             {error}
           </span>
         )}
+        <div className="ml-auto">
+          <MapControls />
+        </div>
       </header>
 
       {studio && <StudioBar keys={keys} setKeys={setKeys} max={count - 1} />}

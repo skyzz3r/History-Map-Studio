@@ -49,8 +49,10 @@ export default function SideSheet({
       </div>
 
       <dl className="space-y-1.5 text-sm">
-        <Row label="Subject to" value={picked.subjectTo} />
-        <Row label="Part of" value={picked.partOf} />
+        {/* Straight off the clicked feature — the exact validity window OHM
+            records for it, which is what the date filter matched on. */}
+        <Row label="Existed" value={range(picked.startDate, picked.endDate)} />
+        <Row label="Level" value={LEVELS[picked.adminLevel ?? 0]} />
         <Row label="Head of state" value={info?.leader} />
         <Row label="Population" value={info?.population} />
       </dl>
@@ -80,6 +82,18 @@ export default function SideSheet({
     </aside>
   );
 }
+
+const LEVELS: Record<number, string> = {
+  2: "Country",
+  3: "Region",
+  4: "State / province",
+  5: "District",
+  6: "County",
+};
+
+/** OHM dates are ISO-ish and end_date is often absent, meaning "still exists". */
+const range = (start?: string, end?: string) =>
+  start || end ? `${start ?? "?"} – ${end ?? "present"}` : undefined;
 
 function Row({ label, value }: { label: string; value?: string }) {
   if (!value) return null;

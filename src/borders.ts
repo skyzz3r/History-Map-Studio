@@ -1,8 +1,14 @@
 // Historical-Basemaps: discrete year snapshots, no start/end dates on features.
-// So "time" is an index into the snapshot list, not a linear year axis. Scrubbing
-// between index 12 and 13 crossfades world_1492 -> world_1500.
-// Bonus: this makes the slider spend its travel where the data is dense instead of
-// burning 99% of it on prehistory (the range is -123000..2010).
+//
+// Demoted to a BACKDROP. OpenHistoricalMap draws the borders you actually
+// interact with, but its hosted tiles cannot serve below zoom 5, so these coarse
+// snapshots are all that stands between you and a blank world view. Nothing here
+// is ever hovered, clicked, or labelled — the polygons are as crude as 4 vertices
+// per country and must not be the source of any claim.
+//
+// It still owns the time AXIS: "time" is an index into the snapshot list, which
+// makes the slider spend its travel where the data is dense instead of burning
+// 99% of it on prehistory (the range is -123000..2010).
 
 const REPO =
   "https://raw.githubusercontent.com/aourednik/historical-basemaps/master";
@@ -89,81 +95,6 @@ export async function getSnapshot(i: number): Promise<unknown> {
   return data;
 }
 
-export type Label = { name: string; at: [number, number]; area: number };
-
-/**
- * One label anchor per feature, for the always-on name layer.
- *
- * Anchors go on the feature's LARGEST ring, not the average of all its points —
- * averaging drops the USA's label in the Pacific between Alaska and Florida.
- * Area comes from the shoelace formula, which is signed, so take |A|; a zero-area
- * ring (a degenerate 4-point country, and this dataset has them) falls back to the
- * first vertex rather than dividing by zero.
- */
-export function labelsFor(data: unknown): Label[] {
-  const out: Label[] = [];
-  for (const f of (data as any)?.features ?? []) {
-    const name = f?.properties?.NAME;
-    if (!name || !f.geometry) continue;
-    const rings: number[][][] =
-      f.geometry.type === "Polygon"
-        ? [f.geometry.coordinates[0]]
-        : f.geometry.type === "MultiPolygon"
-          ? f.geometry.coordinates.map((p: number[][][]) => p[0])
-          : [];
-    let best: number[][] | null = null;
-    let bestArea = -1;
-    for (const r of rings) {
-      const a = Math.abs(ringArea(r));
-      if (a > bestArea) [best, bestArea] = [r, a];
-    }
-    if (best) out.push({ name, at: centroid(best), area: bestArea });
-  }
-  return out;
-}
-
-function ringArea(r: number[][]): number {
-  let a = 0;
-  for (let i = 0, j = r.length - 1; i < r.length; j = i++)
-    a += r[j][0] * r[i][1] - r[i][0] * r[j][1];
-  return a / 2;
-}
-
-function centroid(r: number[][]): [number, number] {
-  const a = ringArea(r);
-  if (!a) return [r[0][0], r[0][1]];
-  let x = 0;
-  let y = 0;
-  for (let i = 0, j = r.length - 1; i < r.length; j = i++) {
-    const cross = r[j][0] * r[i][1] - r[i][0] * r[j][1];
-    x += (r[j][0] + r[i][0]) * cross;
-    y += (r[j][1] + r[i][1]) * cross;
-  }
-  return [x / (6 * a), y / (6 * a)];
-}
-
-/** Stable colour per polity so an empire keeps its hue across snapshots. */
-export function hueFor(name: string): [number, number, number] {
-  let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) | 0;
-  const deg = Math.abs(h) % 360;
-  return hslToRgb(deg, 0.55, 0.55);
-}
-
-function hslToRgb(h: number, s: number, l: number): [number, number, number] {
-  const c = (1 - Math.abs(2 * l - 1)) * s;
-  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
-  const m = l - c / 2;
-  const [r, g, b] =
-    h < 60 ? [c, x, 0]
-    : h < 120 ? [x, c, 0]
-    : h < 180 ? [0, c, x]
-    : h < 240 ? [0, x, c]
-    : h < 300 ? [x, 0, c]
-    : [c, 0, x];
-  return [
-    Math.round((r + m) * 255),
-    Math.round((g + m) * 255),
-    Math.round((b + m) * 255),
-  ];
-}
+// Deleted with deck.gl: labelsFor / hueFor and their shoelace-centroid and
+// HSL helpers. Labels now come from OHM via a MapLibre symbol layer, whose
+// pole-of-inaccessibility placement and collision handling beat both.

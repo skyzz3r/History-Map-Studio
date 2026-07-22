@@ -97,47 +97,44 @@ const soft = (url: string) => json(url).catch(() => undefined);
 const stmts = (qid: string, p: string): Promise<Stmt[]> =>
   soft(`${REST}/${qid}/statements?property=${p}`).then((j) => j?.[p] ?? []);
 
-/** Name + year -> entity card. Never throws; falls back to just the name. */
-export async function lookup(name: string, year: number): Promise<Info> {
+/**
+ * Known Q-id + year -> entity card. This is the accurate path: the id comes from
+ * the clicked feature's own `wikidata` tag, so there is no name-matching step to
+ * get wrong. `fallbackName` is only used if Wikidata has no English label.
+ */
+export async function lookupByQid(
+  qid: string,
+  year: number,
+  fallbackName: string,
+  enTitle?: string,
+): Promise<Info> {
   try {
-    // ponytail: first search hit wins. Map names are ambiguous ("Prussia" resolves
-    // to the region Q38872, not the Kingdom Q27306 that has the leader data).
-    // Scoring several candidates costs a fetch each — do it only if it bites.
-    const search = await json(
-      `${WD}?action=wbsearchentities&search=${encodeURIComponent(name)}` +
-        `&language=en&format=json&limit=1&origin=*`,
-    );
-    const hit = search.search?.[0];
-    const qid: string | undefined = hit?.id;
-    if (!qid) return { name };
-
-    // One round trip for everything, including an optimistic guess at the
-    // Wikipedia title (it equals the label often enough to skip a hop).
-    const [flag, arms, p35, p6, pop, link, guess] = await Promise.all([
+    const [flag, arms, p35, p6, pop, link, name] = await Promise.all([
       stmts(qid, "P41"),
       stmts(qid, "P94"),
       stmts(qid, "P35"),
       stmts(qid, "P6"),
       stmts(qid, "P1082"),
-      soft(`${REST}/${qid}/sitelinks/enwiki`),
-      summary(hit.label ?? name),
+      enTitle ? undefined : soft(`${REST}/${qid}/sitelinks/enwiki`),
+      label(qid),
     ]);
 
     // Polities disagree about which property holds "the ruler": the Kingdom of
     // Prussia uses P35 (head of state), the Roman Empire only has P6 (head of
     // government), and the UK populates both. Try P35, fall back to P6.
-    const ruler = activeAt(p35, year)[0] ?? activeAt(p6, year)[0];
-    const rulerId = ruler?.value?.content;
+    const rulerId = (activeAt(p35, year)[0] ?? activeAt(p6, year)[0])?.value
+      ?.content;
 
     const amount = (closestByYear(pop, year)?.value?.content as { amount?: string })
       ?.amount;
 
-    const title: string | undefined = link?.title;
-    const wiki =
-      guess ?? (title && title !== hit.label ? await summary(title) : undefined);
+    // The OHM `wikipedia` tag beats the sitelink when present: it is the article
+    // a human chose for this exact polity.
+    const title = enTitle ?? link?.title;
+    const wiki = title ? await summary(title) : undefined;
 
     return {
-      name: hit.label ?? name,
+      name: name ?? fallbackName,
       qid,
       flag: commons(activeAt(flag, year)[0]?.value?.content, 240),
       arms: commons(activeAt(arms, year)[0]?.value?.content, 160),
@@ -148,6 +145,74 @@ export async function lookup(name: string, year: number): Promise<Info> {
       summary: wiki?.extract,
       url: wiki?.url,
     };
+  } catch {
+    return { name: fallbackName };
+  }
+}
+
+/** P41 flag FILENAME valid at `year` — "Flag of Bremen.svg" — or undefined. */
+export async function flagFileFor(
+  qid: string,
+  year: number,
+): Promise<string | undefined> {
+  const f = activeAt(await stmts(qid, "P41"), year)[0]?.value?.content;
+  return typeof f === "string" ? f : undefined;
+}
+
+const COMMONS_API = "https://commons.wikimedia.org/w/api.php";
+
+/** Commons treats "_" and " " as the same character in a filename. */
+export const normFile = (f: string) => f.replace(/_/g, " ");
+
+/**
+ * Commons filenames -> thumbnail URLs, many files in ONE request.
+ *
+ * `commons()` above is fine for an <img src>, but NOT for map icons: that URL is
+ * a 302 to upload.wikimedia.org, and only the final hop carries
+ * access-control-allow-origin, so a fetch/createImageBitmap on it is blocked
+ * before it ever redirects. The API hands back the upload.wikimedia.org URL
+ * directly, which is CORS-open and readable.
+ */
+export async function thumbUrls(
+  files: string[],
+  width = 64,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (!files.length) return out;
+  // The API caps titles at 50 per call.
+  for (let i = 0; i < files.length; i += 50) {
+    const batch = files.slice(i, i + 50);
+    const titles = batch.map((f) => `File:${f}`).join("|");
+    const j = await soft(
+      `${COMMONS_API}?action=query&format=json&origin=*&prop=imageinfo` +
+        `&iiprop=url&iiurlwidth=${width}&titles=${encodeURIComponent(titles)}`,
+    );
+    for (const p of Object.values(j?.query?.pages ?? {}) as any[]) {
+      const url = p?.imageinfo?.[0]?.thumburl;
+      // The API normalises underscores to spaces in the title it echoes back,
+      // so key on the normalised form and let callers do the same.
+      if (url) out.set(normFile(String(p.title).replace(/^File:/, "")), url);
+    }
+  }
+  return out;
+}
+
+/**
+ * Name + year -> entity card. The FALLBACK path, for the ~10% of OHM features
+ * with no `wikidata` tag. Never throws; falls back to just the name.
+ */
+export async function lookup(name: string, year: number): Promise<Info> {
+  try {
+    // ponytail: first search hit wins. Map names are ambiguous ("Prussia" resolves
+    // to the region Q38872, not the Kingdom Q27306 that has the leader data), which
+    // is exactly why lookupByQid exists and this is only the fallback.
+    const search = await json(
+      `${WD}?action=wbsearchentities&search=${encodeURIComponent(name)}` +
+        `&language=en&format=json&limit=1&origin=*`,
+    );
+    const qid: string | undefined = search.search?.[0]?.id;
+    if (!qid) return { name };
+    return await lookupByQid(qid, year, name);
   } catch {
     return { name }; // ancient/obscure polities routinely miss; caller shows raw props
   }

@@ -1,9 +1,9 @@
 // The 60Hz path. Nothing here touches React state — the slider is uncontrolled
-// and writes straight to deck props, one MapLibre filter, and one text node.
+// and writes straight to one MapLibre filter, one geojson source, and one text node.
 // That is the whole "transient update" requirement; it needs no store.
 
 import { getSnapshot, nearestIndex, peek, yearAt } from "./borders.ts";
-import { setBorders, setOhmDate } from "./map.ts";
+import { setCoarse, setOhmDate } from "./map.ts";
 import { formatDate, toInputDate } from "./dates.ts";
 
 let current = 0;
@@ -47,15 +47,16 @@ export function applyIndex(i: number, moveSlider = false) {
 
   pushOhm(dec);
 
-  // One snapshot, snapped. No crossfade: two eras at partial opacity showed
-  // borders that never coexisted.
+  // The sub-zoom-5 backdrop only. One snapshot, snapped — no crossfade, since
+  // two eras at partial opacity showed borders that never coexisted. Nothing
+  // reads these features; the precise layers above are what you hover and click.
   const idx = nearestIndex(i);
   const hit = peek(idx);
-  if (hit) return setBorders(idx, hit);
+  if (hit) return setCoarse(hit);
 
   const my = ++token;
   getSnapshot(idx)
-    .then((data) => my === token && setBorders(idx, data))
+    .then((data) => my === token && setCoarse(data))
     .catch((e) => console.error("snapshot load failed", e));
 }
 

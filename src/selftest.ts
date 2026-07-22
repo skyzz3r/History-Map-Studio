@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { lerpBearing, sampleCamera, type Key } from "./keyframes.ts";
 import { activeAt, wdYear } from "./wikidata.ts";
-import { labelsFor } from "./borders.ts";
+import { enTitleOf, parseOverpass, qidOf } from "./ohm.ts";
 import { toDecimalYear, toInputDate } from "./dates.ts";
 
 // --- lerpBearing: must take the short way round ---
@@ -62,40 +62,37 @@ assert.ok(sampleCamera(keys, 0.5)!.lng < 25, "ease-in starts slow");
 // unsorted input must not break bracketing
 assert.equal(sampleCamera([k(4, 200), k(0, 0), k(2, 100)], 3)?.lng, 150);
 
-// --- labelsFor: anchor must land on the BIGGEST landmass, not the average ---
-// A USA-shaped feature: a small Alaska box far west, a large mainland box east.
-// Averaging both would drop the label in the Pacific between them.
-const usa = {
-  features: [
-    {
-      properties: { NAME: "USA" },
-      geometry: {
-        type: "MultiPolygon",
-        coordinates: [
-          [[[-160, 60], [-150, 60], [-150, 70], [-160, 70], [-160, 60]]], // Alaska
-          [[[-100, 30], [-80, 30], [-80, 45], [-100, 45], [-100, 30]]], // mainland
-        ],
-      },
-    },
+// --- ohm: Overpass -> tiles. The sign flip is the part that silently breaks ---
+// Tiles number relations NEGATIVE and the API numbers them positive, so a
+// mismatch here means every lookup misses and every click falls back to a name
+// search — the exact bug this replaced.
+const overpass = {
+  elements: [
+    { type: "relation", id: 2850626, tags: { name: "Regno di Sardegna", wikidata: "Q165154", wikipedia: "en:Kingdom of Sardinia" } },
+    { type: "way", id: 4242, tags: { name: "A way" } },
+    { type: "relation", id: 99, tags: { name: "No links" } },
+    { type: "count", id: 0, tags: { total: "3" } }, // out count emits this
   ],
 };
-const [label] = labelsFor(usa);
-assert.equal(label.name, "USA");
-assert.ok(label.at[0] > -95 && label.at[0] < -85, `lng on mainland, got ${label.at[0]}`);
-assert.ok(label.at[1] > 35 && label.at[1] < 40, `lat on mainland, got ${label.at[1]}`);
-assert.equal(Math.round(label.area), 300, "area of the larger 20x15 box");
+const tags = parseOverpass(overpass);
+assert.ok(tags.has(-2850626), "relation keyed by the NEGATIVE tile osm_id");
+assert.equal(tags.get(-2850626)!.wikidata, "Q165154");
+assert.ok(tags.has(4242), "ways keep their positive id");
+assert.equal(tags.size, 3, "the id:0 count element is dropped");
+assert.deepEqual(parseOverpass({}), new Map());
+assert.deepEqual(parseOverpass(undefined), new Map());
 
-// degenerate ring (this dataset really does contain 4-vertex countries)
-const flat = {
-  features: [
-    {
-      properties: { NAME: "Flat" },
-      geometry: { type: "Polygon", coordinates: [[[5, 5], [6, 5], [7, 5], [5, 5]]] },
-    },
-  ],
-};
-assert.deepEqual(labelsFor(flat)[0].at, [5, 5], "zero area falls back, never NaN");
-assert.deepEqual(labelsFor({ features: [] }), []);
+// A bad wikidata value must yield nothing rather than a request for /entities/junk
+assert.equal(qidOf(tags.get(-2850626)), "Q165154");
+assert.equal(qidOf(tags.get(99)), undefined, "absent tag -> undefined");
+assert.equal(qidOf({ wikidata: "P31" }), undefined, "P-id is not an item");
+assert.equal(qidOf({ wikidata: "Kingdom of Sardinia" }), undefined);
+assert.equal(qidOf(null), undefined);
+
+// Only the English sitelink is usable; a de: link would 404 on en.wikipedia.
+assert.equal(enTitleOf(tags.get(-2850626)), "Kingdom of Sardinia");
+assert.equal(enTitleOf({ wikipedia: "de:Königreich Sardinien" }), undefined);
+assert.equal(enTitleOf(tags.get(99)), undefined);
 
 // --- dates: the whole app's time axis, and the pipeline's GPU filter input ---
 // Year only, and month/day precision.
