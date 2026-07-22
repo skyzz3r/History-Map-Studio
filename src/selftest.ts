@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { lerpBearing, sampleCamera, type Key } from "./keyframes.ts";
 import { activeAt, wdYear } from "./wikidata.ts";
 import { labelsFor } from "./borders.ts";
+import { toDecimalYear, toInputDate } from "./dates.ts";
 
 // --- lerpBearing: must take the short way round ---
 assert.equal(lerpBearing(0, 90, 0.5), 45);
@@ -95,5 +96,40 @@ const flat = {
 };
 assert.deepEqual(labelsFor(flat)[0].at, [5, 5], "zero area falls back, never NaN");
 assert.deepEqual(labelsFor({ features: [] }), []);
+
+// --- dates: the whole app's time axis, and the pipeline's GPU filter input ---
+// Year only, and month/day precision.
+assert.equal(toDecimalYear("1942"), 1942);
+assert.equal(toDecimalYear(undefined), null);
+assert.equal(toDecimalYear("not a date"), null);
+// 12 May is day 132 of a non-leap year, so the fraction is 131/365.
+assert.ok(Math.abs(toDecimalYear("1942-05-12")! - (1942 + 131 / 365)) < 1e-9);
+assert.equal(toDecimalYear("1942-01-01"), 1942, "1 Jan is exactly the year");
+assert.ok(toDecimalYear("1942-12-31")! < 1943, "31 Dec stays inside its year");
+
+// BC: the leading minus must survive, and time must still increase.
+assert.equal(toDecimalYear("-0044-01-01"), -44, "44 BC");
+assert.ok(
+  toDecimalYear("-0044-12-31")! > toDecimalYear("-0044-01-01")!,
+  "December 44 BC is LATER than January 44 BC",
+);
+assert.ok(toDecimalYear("-0044-01-01")! < toDecimalYear("0001-01-01")!);
+
+// Leap years shift day-of-year past February.
+assert.ok(toDecimalYear("2000-03-01")! !== toDecimalYear("1900-03-01")!);
+
+// Round-trip through the inverse, including a leap day.
+for (const iso of ["1942-05-12", "1600-01-01", "2020-02-29", "1789-07-14"]) {
+  const back = toInputDate(toDecimalYear(iso)!);
+  assert.equal(back, iso, `round-trip ${iso} -> ${back}`);
+}
+
+// <input type="date"> cannot express BC, so callers must get null and disable it.
+assert.equal(toInputDate(-44), null, "BC has no native date input value");
+assert.equal(toInputDate(1942 + 131 / 365), "1942-05-12");
+
+// Sentinels used by the pipeline must order correctly against real dates.
+assert.ok(-99999 < toDecimalYear("-3000")!, "no-start sentinel precedes everything");
+assert.ok(99999 > toDecimalYear("2026")!, "no-end sentinel follows everything");
 
 console.log("ok");

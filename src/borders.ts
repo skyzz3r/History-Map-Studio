@@ -31,11 +31,24 @@ export function bracket(index: number, n = snapshots.length) {
   return { a, b, t: i - a };
 }
 
-/** Interpolated calendar year for the slider position, for display only. */
+/**
+ * Decimal year for a slider position. NOT rounded — the fraction is what gives
+ * day-level precision, and it feeds the OHM date filter directly.
+ *
+ * The slider axis is piecewise-linear through the snapshot years rather than
+ * linear in time, so it spends its travel where the data is instead of burning
+ * 99% of the track on prehistory.
+ */
 export function yearAt(index: number): number {
   if (!snapshots.length) return 0;
   const { a, b, t } = bracket(index);
-  return Math.round(snapshots[a].year + (snapshots[b].year - snapshots[a].year) * t);
+  return snapshots[a].year + (snapshots[b].year - snapshots[a].year) * t;
+}
+
+/** Nearest snapshot to a slider position. No blending — one era, or the other. */
+export function nearestIndex(index: number): number {
+  const { a, b, t } = bracket(index);
+  return t < 0.5 ? a : b;
 }
 
 /** Inverse of yearAt: calendar year -> slider index. Lets you jump to an exact year. */

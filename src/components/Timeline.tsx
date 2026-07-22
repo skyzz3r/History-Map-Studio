@@ -1,26 +1,31 @@
 import { useEffect, useRef, useState } from "react";
-import { applyIndex, bindLabel, bindSlider, bindYear, getIndex } from "../scrub.ts";
+import {
+  applyIndex,
+  bindDate,
+  bindLabel,
+  bindSlider,
+  getIndex,
+  settle,
+} from "../scrub.ts";
 import { getSnapshots, indexForYear } from "../borders.ts";
+import { toDecimalYear } from "../dates.ts";
 
 /**
  * Uncontrolled on purpose. onInput fires ~60x/sec while dragging and must not
- * enter React at all — it writes to deck props and one text node directly.
- * The only state here is the play/pause icon.
+ * enter React at all. The only state here is the play/pause icon.
  */
 export default function Timeline({ max }: { max: number }) {
   const label = useRef<HTMLSpanElement>(null);
   const slider = useRef<HTMLInputElement>(null);
-  const year = useRef<HTMLInputElement>(null);
+  const date = useRef<HTMLInputElement>(null);
   const [playing, setPlaying] = useState(false);
 
   const snaps = getSnapshots();
-  const minYear = snaps[0]?.year ?? -123000;
-  const maxYear = snaps[snaps.length - 1]?.year ?? 2010;
 
   useEffect(() => {
     bindLabel(label.current);
     bindSlider(slider.current);
-    bindYear(year.current);
+    bindDate(date.current);
   }, []);
 
   useEffect(() => {
@@ -32,6 +37,7 @@ export default function Timeline({ max }: { max: number }) {
       prev = now;
       if (i >= max) {
         applyIndex(max, true);
+        settle();
         return setPlaying(false);
       }
       applyIndex(i, true);
@@ -40,13 +46,6 @@ export default function Timeline({ max }: { max: number }) {
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
   }, [playing, max]);
-
-  const goToYear = (raw: string) => {
-    const y = Number(raw);
-    if (!Number.isFinite(y) || !snaps.length) return;
-    setPlaying(false);
-    applyIndex(indexForYear(Math.min(maxYear, Math.max(minYear, y))), true);
-  };
 
   return (
     <div className="absolute inset-x-0 bottom-0 flex items-center gap-4 bg-gradient-to-t from-neutral-950 to-transparent px-6 pb-5 pt-12">
@@ -60,22 +59,26 @@ export default function Timeline({ max }: { max: number }) {
 
       <span
         ref={label}
-        className="w-28 shrink-0 font-mono text-lg tabular-nums text-neutral-100"
+        className="w-40 shrink-0 font-mono text-lg tabular-nums text-neutral-100"
       >
         —
       </span>
 
-      {/* Type an exact year, or hold the arrow keys to walk through it. */}
+      {/* Day-level jump. Disabled automatically for BC dates — the native date
+          element has no year 0 or earlier; the slider still reaches them. */}
       <input
-        ref={year}
-        type="number"
-        step={1}
-        min={minYear}
-        max={maxYear}
+        ref={date}
+        type="date"
         disabled={max <= 0}
-        aria-label="Jump to year (negative for BC)"
-        onInput={(e) => goToYear(e.currentTarget.value)}
-        className="w-24 shrink-0 rounded-md border border-neutral-700 bg-neutral-900/80 px-2 py-1 font-mono text-sm tabular-nums text-neutral-200 disabled:opacity-30"
+        aria-label="Jump to date"
+        onInput={(e) => {
+          const dec = toDecimalYear(e.currentTarget.value);
+          if (dec === null) return;
+          setPlaying(false);
+          applyIndex(indexForYear(dec), true);
+          settle();
+        }}
+        className="shrink-0 rounded-md border border-neutral-700 bg-neutral-900/80 px-2 py-1 font-mono text-sm text-neutral-200 disabled:opacity-30 [color-scheme:dark]"
       />
 
       <input
@@ -83,7 +86,7 @@ export default function Timeline({ max }: { max: number }) {
         type="range"
         min={0}
         max={Math.max(max, 0)}
-        step={0.001}
+        step={0.0001}
         defaultValue={0}
         list="eras"
         disabled={max <= 0}
@@ -92,6 +95,8 @@ export default function Timeline({ max }: { max: number }) {
           setPlaying(false);
           applyIndex(+e.currentTarget.value);
         }}
+        onPointerUp={settle}
+        onKeyUp={settle}
         className="h-1 w-full cursor-pointer appearance-none rounded bg-neutral-700 accent-neutral-100 disabled:opacity-30"
       />
       {/* Free era ticks: the browser renders one notch per snapshot. */}

@@ -19,6 +19,32 @@ const BASEMAP =
 const CLUTTER =
   /^(roads|buildings|pois|address|boundaries|places_country|places_region|landuse_(urban|hospital|industrial|school|aerodrome|runway|pier|zoo|pedestrian))/;
 
+// OpenHistoricalMap. Every feature carries its own start/end date, so we can
+// render the true state on a given DAY instead of dissolving between snapshots.
+// Point this at a self-hosted pmtiles:// URL if scripts/build-tiles.sh is run —
+// nothing else changes.
+const OHM_TILES = "https://vtiles.openhistoricalmap.org/boundaries/{z}/{x}/{y}";
+
+// OHM's hosted tiles expose start_decdate/end_decdate; our own pipeline emits
+// start_num/end_num. coalesce covers both so the source can be swapped freely.
+// The sentinels matter: a boundary with no start has always existed and one
+// with no end still exists, whereas null loses every numeric comparison and
+// would silently erase the feature.
+const dateFilter = (dec: number): any => [
+  "all",
+  ["<=", ["coalesce", ["get", "start_decdate"], ["get", "start_num"], -99999], dec],
+  [">=", ["coalesce", ["get", "end_decdate"], ["get", "end_num"], 99999], dec],
+];
+
+const OHM_LAYERS = ["ohm-fill", "ohm-line"];
+
+/** Show the boundaries valid on `dec`. Pure GPU filter — no data refetch. */
+export function setOhmDate(dec: number) {
+  if (!map?.getLayer("ohm-line")) return;
+  const f = dateFilter(dec);
+  for (const id of OHM_LAYERS) map.setFilter(id, f);
+}
+
 export let map: maplibregl.Map;
 let overlay: MapboxOverlay | null = null;
 
@@ -42,10 +68,64 @@ export async function initMap(
         url: BASEMAP,
         attribution: "© OpenStreetMap, Protomaps",
       },
+      // minzoom 5 is not cosmetic. OHM's hosted tiles carry ~40 name_*
+      // localisations per feature with no per-zoom simplification, so a z3 tile
+      // is 2.8-4 MB and times out; z6 is 175 KB and lands in ~100ms. Below z5
+      // the coarse Historical-Basemaps fills carry the view instead.
+      // Running scripts/build-tiles.sh drops those fields and would let this go
+      // to 0.
+      ohm: {
+        type: "vector",
+        tiles: [OHM_TILES],
+        minzoom: 5,
+        maxzoom: 12,
+        attribution: "© OpenHistoricalMap",
+      },
     },
-    layers: layers("protomaps", namedFlavor("dark"), { lang: "en" }).filter(
-      (l) => !CLUTTER.test(l.id),
-    ),
+    layers: [
+      ...layers("protomaps", namedFlavor("dark"), { lang: "en" }).filter(
+        (l) => !CLUTTER.test(l.id),
+      ),
+      // Starts filtered to nothing; setOhmDate supplies the real filter once a
+      // date is set. admin_level 2 is national, 4 regional, higher is local.
+      {
+        id: "ohm-fill",
+        type: "fill",
+        source: "ohm",
+        "source-layer": "boundaries",
+        filter: dateFilter(-1e9),
+        paint: {
+          "fill-color": [
+            "case",
+            ["has", "disputed_by"], "#d97706",
+            ["==", ["get", "admin_level"], 2], "#e5e7eb",
+            "#94a3b8",
+          ],
+          "fill-opacity": ["interpolate", ["linear"], ["zoom"], 3, 0.04, 8, 0.1],
+        },
+      },
+      {
+        id: "ohm-line",
+        type: "line",
+        source: "ohm",
+        "source-layer": "boundaries",
+        filter: dateFilter(-1e9),
+        paint: {
+          "line-color": [
+            "case",
+            ["has", "disputed_by"], "#f59e0b",
+            ["==", ["get", "admin_level"], 2], "#f8fafc",
+            "#cbd5e1",
+          ],
+          "line-width": [
+            "interpolate", ["linear"], ["zoom"],
+            3, ["case", ["==", ["get", "admin_level"], 2], 1.1, 0.4],
+            10, ["case", ["==", ["get", "admin_level"], 2], 2.4, 1],
+          ],
+          "line-opacity": 0.9,
+        },
+      },
+    ],
   };
 
   map = new maplibregl.Map({
@@ -73,25 +153,26 @@ export async function initMap(
 
   // Which labels are worth drawing depends on zoom, so rebuild on zoom, not just
   // on scrub. Cheap: the snapshot data is unchanged, deck reuses its buffers.
-  map.on("zoomend", () => last && setBorders(...last));
+  map.on("zoomend", () => last && setBorders(last.index, last.data));
 
   new ResizeObserver(() => map.resize()).observe(container);
   return map;
 }
 
-type Side = { index: number; data: unknown } | null;
-let last: [Side, Side, number] | null = null;
+let last: { index: number; data: unknown } | null = null;
 
-/** Two stacked snapshots crossfading by `t`. Called at scrub rate — must stay cheap. */
-export function setBorders(a: Side, b: Side, t: number) {
-  last = [a, b, t];
-  const front = t < 0.5 ? a : b;
-  const built = [
-    a && border(a.index, a.data, 1 - t, t < 0.5),
-    b && b.index !== a?.index ? border(b.index, b.data, t, t >= 0.5) : null,
-    front && names(front.index, front.data),
-  ].filter(Boolean);
-  if (!built.length) return;
+/**
+ * Exactly ONE snapshot, fully opaque.
+ *
+ * This used to draw two snapshots crossfading by an interpolation factor, which
+ * meant 1492 and 1500 were on screen simultaneously at partial opacity —
+ * borders ghosting through each other for years at a time, showing a state that
+ * never existed. Snapping to the nearest snapshot shows a real historical map;
+ * genuinely dated boundaries come from the OHM layers above.
+ */
+export function setBorders(index: number, data: unknown) {
+  last = { index, data };
+  const built = [border(index, data), names(index, data)];
 
   // interleaved:true renders deck into MapLibre's own canvas, so PNG export is a
   // single toDataURL with no compositing step. But an interleaved overlay added
@@ -105,14 +186,15 @@ export function setBorders(a: Side, b: Side, t: number) {
   }
 }
 
-// Layer id is keyed to the snapshot, so scrubbing within a pair only changes
-// `opacity` — deck reuses the tessellated buffers instead of rebuilding them.
-function border(index: number, data: unknown, opacity: number, pickable: boolean) {
+// Layer id is keyed to the snapshot, so re-running this for the same era reuses
+// deck's tessellated buffers instead of rebuilding them.
+function border(index: number, data: unknown) {
   return new GeoJsonLayer({
     id: `borders-${index}`,
     data: data as never,
-    opacity,
-    pickable,
+    // Under OHM's crisp dated lines: this is the coarse always-available base.
+    beforeId: "ohm-fill",
+    pickable: true,
     autoHighlight: true,
     highlightColor: [255, 255, 255, 90],
     filled: true,
