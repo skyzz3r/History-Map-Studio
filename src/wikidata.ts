@@ -167,8 +167,8 @@ export const normFile = (f: string) => f.replace(/_/g, " ");
 /**
  * Commons filenames -> thumbnail URLs, many files in ONE request.
  *
- * `commons()` above is fine for an <img src>, but NOT for map icons: that URL is
- * a 302 to upload.wikimedia.org, and only the final hop carries
+ * `commons()` above is fine as an image element's source, but NOT for map icons:
+ * that URL is a 302 to upload.wikimedia.org, and only the final hop carries
  * access-control-allow-origin, so a fetch/createImageBitmap on it is blocked
  * before it ever redirects. The API hands back the upload.wikimedia.org URL
  * directly, which is CORS-open and readable.
