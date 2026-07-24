@@ -1,4 +1,4 @@
-import type { Picked } from "../map.ts";
+import { drillInto, type Picked } from "../map.ts";
 import type { Info } from "../wikidata.ts";
 
 export default function SideSheet({
@@ -49,13 +49,20 @@ export default function SideSheet({
       </div>
 
       <dl className="space-y-1.5 text-sm">
-        {/* Straight off the clicked feature — the exact validity window OHM
-            records for it, which is what the date filter matched on. */}
+        {/* Straight off the clicked feature — the exact validity window the
+            source records for it, which is what the date filter matched on. */}
         <Row label="Existed" value={range(picked.startDate, picked.endDate)} />
         <Row label="Level" value={LEVELS[picked.adminLevel ?? 0]} />
         <Row label="Head of state" value={info?.leader} />
         <Row label="Population" value={info?.population} />
       </dl>
+
+      <button
+        onClick={() => void drillInto(picked)}
+        className="rounded-lg bg-neutral-800 px-3 py-1.5 text-left text-sm text-neutral-200 hover:bg-neutral-700"
+      >
+        Show subdivisions ↓
+      </button>
 
       {info?.summary && (
         <p className="text-sm leading-relaxed text-neutral-300">{info.summary}</p>

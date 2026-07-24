@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { loadIndex, yearAt } from "./borders.ts";
-import { initMap, type Picked } from "./map.ts";
+import { bindFocusChange, drillOut, getFocus, initMap, type Picked } from "./map.ts";
 import { applyIndex, getIndex } from "./scrub.ts";
 import { lookup, lookupByQid, type Info } from "./wikidata.ts";
 import { cachedTags, enTitleOf, fetchTags, qidOf } from "./ohm.ts";
+import { initialFocus, type FocusState } from "./focus.ts";
 import type { Key } from "./keyframes.ts";
 import Timeline from "./components/Timeline.tsx";
 import SideSheet from "./components/SideSheet.tsx";
 import StudioBar from "./components/StudioBar.tsx";
 import MapControls from "./components/MapControls.tsx";
+import Breadcrumb from "./components/Breadcrumb.tsx";
 
 export default function App() {
   const container = useRef<HTMLDivElement>(null);
@@ -18,6 +20,7 @@ export default function App() {
   const [info, setInfo] = useState<Info | null>(null);
   const [studio, setStudio] = useState(false);
   const [keys, setKeys] = useState<Key[]>([]);
+  const [focus, setFocus] = useState<FocusState>(initialFocus);
 
   useEffect(() => {
     let cancelled = false;
@@ -26,8 +29,10 @@ export default function App() {
         const snaps = await loadIndex();
         if (cancelled) return;
         setCount(snaps.length);
+        bindFocusChange(setFocus);
         await initMap(container.current!, setPicked);
         if (cancelled) return;
+        setFocus(getFocus());
         applyIndex(snaps.length - 1, true); // open on the present day
       } catch (e) {
         setError(String(e));
@@ -49,12 +54,21 @@ export default function App() {
     let stale = false;
     (async () => {
       const year = yearAt(getIndex());
-      await fetchTags([picked.osmId]);
-      if (stale) return;
-      const tags = cachedTags(picked.osmId);
-      const qid = qidOf(tags);
+      // Our own tiles bake the wikidata tag in, so this costs nothing. Only the
+      // hosted tiles, which drop it, need the Overpass round trip.
+      let qid = picked.qid;
+      let title = picked.wikipedia?.startsWith("en:")
+        ? picked.wikipedia.slice(3)
+        : undefined;
+      if (!qid && picked.osmId) {
+        await fetchTags([picked.osmId]);
+        if (stale) return;
+        const tags = cachedTags(picked.osmId);
+        qid = qidOf(tags);
+        title = enTitleOf(tags);
+      }
       const i = qid
-        ? await lookupByQid(qid, year, picked.name, enTitleOf(tags))
+        ? await lookupByQid(qid, year, picked.name, title)
         : await lookup(picked.name, year);
       if (!stale) setInfo(i);
     })();
@@ -83,6 +97,7 @@ export default function App() {
             {error}
           </span>
         )}
+        <Breadcrumb focus={focus} onJump={drillOut} />
         <div className="ml-auto">
           <MapControls />
         </div>

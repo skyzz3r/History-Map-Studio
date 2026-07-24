@@ -12,11 +12,22 @@
 const OVERPASS = "https://overpass-api.openhistoricalmap.org/api/interpreter";
 
 export type Tags = Record<string, string>;
+export type Bounds = {
+  minlat: number;
+  minlon: number;
+  maxlat: number;
+  maxlon: number;
+};
 
 // null means "asked, nothing there" — cached so we never ask twice.
 const cache = new Map<number, Tags | null>();
+// Exact GLOBAL bounds, unlike anything derivable from clipped tile geometry.
+// Free: `out tags bb` returns them from the request we already make for the
+// wikidata tag, so drill-down costs no extra round trip.
+const bounds = new Map<number, Bounds>();
 
 export const cachedTags = (osmId: number) => cache.get(osmId);
+export const cachedBounds = (osmId: number) => bounds.get(osmId);
 
 /**
  * Tile osm_id -> Overpass element ref. Relations are negative in the tiles and
@@ -37,6 +48,16 @@ export function parseOverpass(body: unknown): Map<number, Tags> {
   for (const el of (body as any)?.elements ?? []) {
     if (!el?.id || !el.tags) continue;
     out.set(osmIdOf(el), el.tags as Tags);
+  }
+  return out;
+}
+
+/** Bounds keyed the same way as tags, for the elements that carry them. */
+export function parseBounds(body: unknown): Map<number, Bounds> {
+  const out = new Map<number, Bounds>();
+  for (const el of (body as any)?.elements ?? []) {
+    if (!el?.id || !el.bounds) continue;
+    out.set(osmIdOf(el), el.bounds as Bounds);
   }
   return out;
 }
@@ -63,11 +84,13 @@ export async function fetchTags(osmIds: number[]): Promise<void> {
 
   const rels = want.filter((id) => id < 0).map((id) => ref(id).id);
   const ways = want.filter((id) => id > 0).map((id) => ref(id).id);
+  // `out tags bb` — the bb costs nothing extra and gives drill-down the exact
+  // global bounding box, which clipped tile geometry cannot provide.
   const q =
     "[out:json][timeout:30];(" +
     (rels.length ? `rel(id:${rels.join(",")});` : "") +
     (ways.length ? `way(id:${ways.join(",")});` : "") +
-    ");out tags;";
+    ");out tags bb;";
 
   try {
     const r = await fetch(OVERPASS, {
@@ -75,7 +98,9 @@ export async function fetchTags(osmIds: number[]): Promise<void> {
       body: new URLSearchParams({ data: q }),
     });
     if (!r.ok) throw new Error(`overpass ${r.status}`);
-    const found = parseOverpass(await r.json());
+    const body = await r.json();
+    const found = parseOverpass(body);
+    for (const [id, b] of parseBounds(body)) bounds.set(id, b);
     // Cache the misses too, or a feature Overpass has no tags for is re-fetched
     // on every single idle.
     for (const id of want) cache.set(id, found.get(id) ?? null);

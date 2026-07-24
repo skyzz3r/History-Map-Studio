@@ -4,8 +4,12 @@
 import assert from "node:assert/strict";
 import { lerpBearing, sampleCamera, type Key } from "./keyframes.ts";
 import { activeAt, wdYear } from "./wikidata.ts";
-import { enTitleOf, parseOverpass, qidOf } from "./ohm.ts";
+import { enTitleOf, parseBounds, parseOverpass, qidOf } from "./ohm.ts";
 import { toDecimalYear, toInputDate } from "./dates.ts";
+import { inside, labelPoint, pointOnSurface } from "./geo.ts";
+import { buildLabelPoints } from "./labels.ts";
+import { focusFilter, inBounds, nextLevel } from "./focus.ts";
+import { normaliseCShapes, normaliseHB } from "./sources.ts";
 
 // --- lerpBearing: must take the short way round ---
 assert.equal(lerpBearing(0, 90, 0.5), 45);
@@ -128,5 +132,165 @@ assert.equal(toInputDate(1942 + 131 / 365), "1942-05-12");
 // Sentinels used by the pipeline must order correctly against real dates.
 assert.ok(-99999 < toDecimalYear("-3000")!, "no-start sentinel precedes everything");
 assert.ok(99999 > toDecimalYear("2026")!, "no-end sentinel follows everything");
+
+// --- geo: the label anchor must be INSIDE, and on the biggest landmass ---
+const box = (x0: number, y0: number, x1: number, y1: number) => [
+  [x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0],
+];
+
+// A USA-shaped feature: small Alaska box far west, large mainland box east.
+// Averaging the two would drop the label in the Pacific between them.
+const usa = {
+  type: "MultiPolygon",
+  coordinates: [[box(-160, 60, -150, 70)], [box(-100, 30, -80, 45)]],
+};
+const usaLabel = labelPoint(usa)!;
+assert.ok(usaLabel.at[0] > -100 && usaLabel.at[0] < -80, "lng on the mainland");
+assert.ok(usaLabel.at[1] > 30 && usaLabel.at[1] < 45, "lat on the mainland");
+assert.equal(Math.round(usaLabel.area), 300, "area of the larger 20x15 box");
+
+// A C-shape: its centroid falls in the notch, OUTSIDE the polygon. The anchor
+// must not, or a label lands in the sea beside the country it names.
+const cShape = [
+  [0, 0], [10, 0], [10, 3], [3, 3], [3, 7], [10, 7], [10, 10], [0, 10], [0, 0],
+];
+assert.ok(!inside([6, 5], cShape), "the notch really is outside");
+assert.ok(inside(pointOnSurface(cShape), cShape), "anchor lands inside the C");
+assert.equal(labelPoint(null), null);
+assert.equal(labelPoint({ type: "LineString", coordinates: [] }), null);
+
+// --- labels: ONE point per polity, whatever the tiles do ---
+// The Lyon/Paris bug: tile clipping hands us France as several pieces. Same
+// osm_id must collapse to a single label, on the largest piece.
+const clipped = [
+  { properties: { osm_id: -1, name: "France", area: 999 },
+    geometry: { type: "Polygon", coordinates: [box(0, 40, 2, 42)] } },   // small
+  { properties: { osm_id: -1, name: "France", area: 999 },
+    geometry: { type: "Polygon", coordinates: [box(2, 44, 8, 50)] } },   // large
+  { properties: { osm_id: -2, name: "Iberia", area: 500 },
+    geometry: { type: "Polygon", coordinates: [box(-9, 36, -1, 43)] } },
+] as any;
+const built = buildLabelPoints(clipped);
+assert.equal(built.features.length, 2, "France collapses to ONE label");
+const fr = built.features.find((f) => f.properties.name === "France")!;
+assert.ok(fr.geometry.coordinates[0] > 2, "label sits on the LARGER piece");
+assert.equal(fr.properties.area, 999, "keeps the global area for sort-key");
+
+// A precomputed point from our own pipeline always beats a clipped polygon.
+const mixed = [
+  { properties: { osm_id: -1, name: "France", area: 999 },
+    geometry: { type: "Polygon", coordinates: [box(2, 44, 8, 50)] } },
+  { properties: { osm_id: -1, name: "France", area: 999 },
+    geometry: { type: "Point", coordinates: [2.5, 46.5] } },
+] as any;
+const m1 = buildLabelPoints(mixed).features;
+assert.equal(m1.length, 1);
+assert.deepEqual(m1[0].geometry.coordinates, [2.5, 46.5], "pipeline point wins");
+// ...regardless of the order they arrive in.
+assert.deepEqual(
+  buildLabelPoints([mixed[1], mixed[0]] as any).features[0].geometry.coordinates,
+  [2.5, 46.5],
+  "and wins when it arrives first too",
+);
+assert.deepEqual(buildLabelPoints([] as any).features, []);
+// Nameless features must not produce a blank label.
+assert.deepEqual(
+  buildLabelPoints([{ properties: { osm_id: -9 },
+    geometry: { type: "Point", coordinates: [0, 0] } }] as any).features,
+  [],
+);
+
+// --- focus: countries stay visible, deeper levels are gated ---
+assert.deepEqual(focusFilter({ trail: [], maxLevel: 2, allow: null }),
+  ["<=", ["coalesce", ["get", "admin_level"], 99], 2]);
+// With an allow-list, level<=2 still passes so the parent keeps its context.
+const gated: any = focusFilter({ trail: [], maxLevel: 4, allow: [7, 8] });
+assert.equal(gated[0], "all");
+assert.deepEqual(gated[2][2], ["in", ["get", "osm_id"], ["literal", [7, 8]]]);
+
+// The subdivisions tier is the one with the MOST members, not the shallowest.
+// Drilling into Prussia really did find a single admin_level 3 feature (Neutral
+// Moresnet) beside a dozen level-4 provinces; taking the shallowest showed
+// Moresnet alone and hid every province.
+assert.equal(nextLevel(2, new Map([[3, 1], [4, 12]])), 4, "12 provinces beat 1 oddity");
+assert.equal(nextLevel(2, new Map([[4, 5], [6, 40]])), 6, "deeper tier can win");
+assert.equal(nextLevel(2, new Map([[2, 90]])), 2, "nothing deeper -> stay put");
+assert.equal(nextLevel(2, new Map()), 2, "no children -> stay put");
+// Ties go to the shallower tier, which is the more useful default.
+assert.equal(nextLevel(2, new Map([[4, 7], [6, 7]])), 4);
+
+// Why childIds does point-in-polygon and NOT a bounding box. Prussia's real
+// bbox (47.6-55.9N, 5.9-22.9E) contains southern Denmark, and the first version
+// of this genuinely listed Holbæk and Randers as Prussian provinces.
+const prussiaBox = { minlat: 47.6, minlon: 5.87, maxlat: 55.9, maxlon: 22.89 };
+const holbaek: [number, number] = [11.7, 55.7]; // a Danish amt
+assert.ok(inBounds(holbaek, prussiaBox), "a bbox test WOULD wrongly include it");
+// An L-shaped Prussia that stops short of Denmark: the polygon test rejects it.
+const prussia = [
+  [5.9, 47.6], [22.9, 47.6], [22.9, 55.9], [14, 55.9], [14, 53], [5.9, 53], [5.9, 47.6],
+];
+assert.ok(!inside(holbaek, prussia), "point-in-polygon correctly excludes it");
+assert.ok(inside([13, 52.5], prussia), "Berlin is still inside");
+
+// --- overpass bounds: same call as the tags, same negative-id convention ---
+const withBb = {
+  elements: [
+    { type: "relation", id: 2694606, tags: { name: "Preussen" },
+      bounds: { minlat: 47.6, minlon: 5.8, maxlat: 55.8, maxlon: 22.8 } },
+    { type: "relation", id: 5, tags: { name: "No bounds" } },
+  ],
+};
+const bb = parseBounds(withBb);
+assert.ok(bb.has(-2694606), "bounds keyed by the NEGATIVE tile osm_id");
+assert.equal(bb.size, 1, "elements without bounds are skipped");
+assert.equal(parseOverpass(withBb).size, 2, "tags still parse alongside");
+
+// --- CShapes: its own date columns must become the shared start_num/end_num ---
+const cs = normaliseCShapes({
+  features: [
+    { properties: { cntry_name: "France", gwcode: 220,
+        gwsyear: 1886, gwsmonth: 1, gwsday: 1,
+        gweyear: 2019, gwemonth: 12, gweday: 31 } },
+    { properties: { cntry_name: "Nowhere", gwcode: 999 } },
+  ],
+});
+const [f1, f2] = cs.features.map((f: any) => f.properties);
+assert.equal(f1.start_num, 1886);
+assert.ok(f1.end_num > 2019 && f1.end_num < 2020);
+assert.equal(f1.name, "France");
+assert.equal(f1.osm_id, 220, "gwcode stands in for osm_id");
+assert.equal(f1.admin_level, 2);
+// Missing dates must become sentinels, never null: a null loses every numeric
+// comparison and the feature would silently vanish instead of always showing.
+assert.equal(f2.start_num, -99999);
+assert.equal(f2.end_num, 99999);
+
+// --- Historical-Basemaps carries NAME and nothing else ---
+// Without a stamped admin_level the hierarchy filter (admin_level <= 2) matched
+// nothing and the whole source rendered blank.
+const hb = normaliseHB({
+  features: [
+    { properties: { NAME: "Gaul" } },
+    { properties: { NAME: "Roma", SUBJECTO: "Roma" } },
+  ],
+});
+const hp = hb.features.map((f: any) => f.properties);
+assert.equal(hp[0].admin_level, 2, "stamped, else the focus filter hides it");
+assert.equal(hp[0].name, "Gaul", "NAME -> name for the shared label code");
+assert.notEqual(hp[0].osm_id, hp[1].osm_id, "ids must differ, or labels collapse");
+assert.deepEqual(normaliseHB({ features: [] }).features, []);
+assert.doesNotThrow(() => normaliseHB(undefined));
+
+// One label per polity must still hold for Historical-Basemaps, whose distinct
+// ids are strings rather than numbers.
+const hbLabels = buildLabelPoints([
+  { properties: { osm_id: "hb-0", name: "Gaul" },
+    geometry: { type: "Polygon", coordinates: [box(0, 44, 6, 50)] } },
+  { properties: { osm_id: "hb-0", name: "Gaul" },
+    geometry: { type: "Polygon", coordinates: [box(6, 44, 8, 46)] } },
+  { properties: { osm_id: "hb-1", name: "Roma" },
+    geometry: { type: "Polygon", coordinates: [box(10, 40, 16, 46)] } },
+] as any);
+assert.equal(hbLabels.features.length, 2, "string ids dedupe too");
 
 console.log("ok");

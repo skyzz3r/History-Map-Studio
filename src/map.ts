@@ -1,8 +1,27 @@
 import maplibregl, { type StyleSpecification } from "maplibre-gl";
 import { Protocol } from "pmtiles";
 import { layers, namedFlavor } from "@protomaps/basemaps";
-import { cachedTags, fetchTags, qidOf } from "./ohm.ts";
+import { cachedBounds, cachedTags, fetchTags, qidOf } from "./ohm.ts";
 import { flagFileFor, normFile, thumbUrls } from "./wikidata.ts";
+import {
+  SOURCES,
+  dateFilter,
+  detectOhm,
+  ohmIsLocal,
+  ohmMinZoom,
+  normaliseHB,
+  saveSources,
+  savedSources,
+  type Source,
+} from "./sources.ts";
+import { buildLabelPoints } from "./labels.ts";
+import {
+  childIds,
+  focusFilter,
+  initialFocus,
+  nextLevel,
+  type FocusState,
+} from "./focus.ts";
 
 // Source Cooperative's mirror of the Protomaps planet, NOT build.protomaps.com.
 // The build bucket only sends access-control-allow-origin for localhost origins, so
@@ -14,51 +33,76 @@ const BASEMAP =
 
 // The basemap is a backdrop for historical borders, so drop everything modern:
 // roads, buildings, POIs, and — critically — present-day country boundaries and
-// labels, which would contradict whatever era is on screen.
+// labels, which would contradict whatever era is on screen. The `today` source
+// re-enables the boundary half of this on demand.
 const CLUTTER =
-  /^(roads|buildings|pois|address|boundaries|places_country|places_region|landuse_(urban|hospital|industrial|school|aerodrome|runway|pier|zoo|pedestrian))/;
+  /^(roads|buildings|pois|address|landuse_(urban|hospital|industrial|school|aerodrome|runway|pier|zoo|pedestrian))/;
+const PRESENT_DAY = /^(boundaries|places_country|places_region)/;
 
 const GLYPHS =
   "https://protomaps.github.io/basemaps-assets/fonts/{fontstack}/{range}.pbf";
 
-// OpenHistoricalMap. Every feature carries its own start/end date, so we can
-// render the true state on a given DAY instead of dissolving between snapshots.
-// Point this at a self-hosted pmtiles:// URL if scripts/build-tiles.sh is run —
-// nothing else in this file changes.
-const OHM_TILES = "https://vtiles.openhistoricalmap.org/boundaries/{z}/{x}/{y}";
-
-// Below this the hosted tiles are unusable: measured 4.7 MB at z3 versus 1.3 MB
-// at z5, because OHM ships ~300 name_* localisations per feature (78% of the
-// attribute bytes) with no per-zoom simplification. The coarse underlay covers
-// the world view instead. Running the pipeline strips those fields and this
-// could go to 0.
-const OHM_MINZOOM = 5;
-
 // ---------------------------------------------------------------------------
-// Date filtering — pure GPU, no refetch
+// State
 // ---------------------------------------------------------------------------
 
-// OHM's hosted tiles expose start_decdate/end_decdate; our own pipeline emits
-// start_num/end_num. coalesce covers both so the source can be swapped freely.
-// The sentinels matter: a boundary with no start has always existed and one
-// with no end still exists, whereas null loses every numeric comparison and
-// would silently erase the feature.
-const dateFilter = (dec: number): any => [
-  "all",
-  ["<=", ["coalesce", ["get", "start_decdate"], ["get", "start_num"], -99999], dec],
-  [">=", ["coalesce", ["get", "end_decdate"], ["get", "end_num"], 99999], dec],
-];
-
-const OHM_LAYERS = ["ohm-fill", "ohm-line", "ohm-label"];
+export let map: maplibregl.Map;
 
 let currentDate = -1e9;
+let enabled: string[] = [];
+let focus: FocusState = initialFocus();
+let onFocusChange: ((f: FocusState) => void) | null = null;
 
-/** Show the boundaries valid on `dec`. Pure GPU filter — no data refetch. */
+export const getFocus = () => focus;
+export const bindFocusChange = (fn: (f: FocusState) => void) => {
+  onFocusChange = fn;
+};
+
+export type Picked = {
+  osmId: number;
+  name: string;
+  adminLevel?: number;
+  startDate?: string;
+  endDate?: string;
+  qid?: string;
+  wikipedia?: string;
+};
+
+const active = () => SOURCES.filter((s) => enabled.includes(s.id));
+/** Sources that own hover/click, in priority order. */
+const pickable = () =>
+  active().filter((s) => s.pickLayer && map.getLayer(s.pickLayer));
+
+// ---------------------------------------------------------------------------
+// Date + focus -> layer filters
+// ---------------------------------------------------------------------------
+
+/**
+ * Every filterable layer gets date AND focus. Pure GPU — no refetch.
+ *
+ * No isStyleLoaded() guard: that returns false while tiles are still streaming,
+ * and an early return here left a just-attached source permanently unfiltered —
+ * CShapes rendered all of 1886-2019 at once. getLayer below is the real guard.
+ */
+function applyFilters() {
+  if (!map) return;
+  const date = dateFilter(currentDate);
+  const f = focusFilter(focus);
+  for (const s of active()) {
+    for (const id of s.layers) {
+      if (!map.getLayer(id)) continue;
+      // The present-day source has no dates and no hierarchy; it is a reference
+      // overlay, so filtering it would blank it.
+      map.setFilter(id, s.id === "today" ? null : ["all", date, f]);
+    }
+  }
+  if (map.getLayer("hist-label")) map.setFilter("hist-label", ["all", date, f]);
+}
+
 export function setOhmDate(dec: number) {
   currentDate = dec;
-  if (!map?.getLayer("ohm-line")) return;
-  const f = dateFilter(dec);
-  for (const id of OHM_LAYERS) map.setFilter(id, f);
+  applyFilters();
+  queueLabels();
 }
 
 // ---------------------------------------------------------------------------
@@ -66,7 +110,7 @@ export function setOhmDate(dec: number) {
 // ---------------------------------------------------------------------------
 
 /**
- * Year out of an OHM date string, for the line under each country name.
+ * Year out of a date string, for the line under each country name.
  *
  * Two cases the data really contains that a naive slice(0,4) gets wrong: 47 of
  * 980 features in a sample tile have no end_date at all, and 25 have BC starts
@@ -77,8 +121,7 @@ const yearOf = (prop: string, fallback: string): any => [
   ["!", ["has", prop]],
   fallback,
   ["==", ["slice", ["get", prop], 0, 1], "-"],
-  // Round-trip through a number to drop OHM's zero padding: "-0218" would
-  // otherwise read "0218 BC".
+  // Round-trip through a number to drop the zero padding, else "0218 BC".
   ["concat", ["to-string", ["to-number", ["slice", ["get", prop], 1, 5], 0]], " BC"],
   ["slice", ["get", prop], 0, 4],
 ];
@@ -99,6 +142,11 @@ const labelText: any = [
 
 export type Basemap = { id: string; label: string; style: () => unknown };
 
+const baseLayers = (flavor: "dark" | "light") =>
+  layers("protomaps", namedFlavor(flavor), { lang: "en" }).filter(
+    (l) => !CLUTTER.test(l.id) && !(PRESENT_DAY.test(l.id) && !enabled.includes("today")),
+  );
+
 const protomaps = (flavor: "dark" | "light"): StyleSpecification => ({
   version: 8,
   glyphs: GLYPHS,
@@ -112,9 +160,7 @@ const protomaps = (flavor: "dark" | "light"): StyleSpecification => ({
       attribution: "© OpenStreetMap, Protomaps",
     },
   },
-  layers: layers("protomaps", namedFlavor(flavor), { lang: "en" }).filter(
-    (l) => !CLUTTER.test(l.id),
-  ),
+  layers: baseLayers(flavor),
 });
 
 const blank = (): StyleSpecification => ({
@@ -166,146 +212,72 @@ export async function setBasemap(choice: string) {
 }
 
 // ---------------------------------------------------------------------------
-// Map
+// Our layers
 // ---------------------------------------------------------------------------
 
-export let map: maplibregl.Map;
-
-export type Picked = {
-  osmId: number;
-  name: string;
-  adminLevel?: number;
-  startDate?: string;
-  endDate?: string;
-};
-
 let coarse: unknown = null;
+let attaching = false;
 
 /**
- * Our sources and layers, on top of whatever basemap is loaded. Called at init
- * and again after every setStyle.
+ * Attach every enabled source plus the shared label layer, on top of whatever
+ * basemap is loaded. Runs at init and again after every setStyle.
  */
-function addHistoryLayers() {
-  // Guard on OUR OWN layer, never on a source name. OHM's Historical style
-  // ships a source called "ohm" of its own, so a getSource("ohm") check saw
-  // theirs, returned early, and our layers never came back after that switch.
-  // Hence the "hist-" prefixes below too.
-  if (map.getLayer("ohm-fill")) return;
+async function addHistoryLayers() {
+  // Guard on OUR OWN layer, never on a source name: OHM's Historical basemap
+  // style ships a source called "ohm" of its own, so a getSource("ohm") check
+  // saw theirs and our layers never came back after that switch. Hence the
+  // "hist-" prefixes on every source id below.
+  if (attaching || map.getLayer("hist-label")) return;
+  attaching = true;
+  try {
+    for (const s of active()) {
+      if (s.layers.some((l) => map.getLayer(l))) continue;
+      await s.attach(map);
+    }
+    if (coarse) setCoarse(coarse);
+    addLabelLayer();
+    applyFilters();
+    queueLabels();
+  } finally {
+    attaching = false;
+  }
+}
 
-  // Historical-Basemaps: a BACKDROP ONLY, and only below OHM's minzoom so the
-  // world view is not blank. It is deliberately absent from OHM_LAYERS, has no
-  // label layer, and is never queried — every fact this app reports comes from
-  // OHM. Its polygons are as coarse as 4 vertices per country, which is exactly
-  // what made hover and click untrustworthy when deck.gl drew them.
-  map.addSource("hist-coarse", {
-    type: "geojson",
-    data: (coarse ?? { type: "FeatureCollection", features: [] }) as never,
-  });
+/**
+ * The visible labels, drawn from a plain GeoJSON source.
+ *
+ * Deliberately NOT bound to a vector source. Tiles clip France into pieces and
+ * every piece gets its own label — a flag near Lyon and another near Paris. A
+ * GeoJSON source is never tiled, so one polity can only ever produce one symbol.
+ */
+function addLabelLayer() {
+  if (!map.getSource("hist-labels"))
+    map.addSource("hist-labels", {
+      type: "geojson",
+      data: { type: "FeatureCollection", features: [] },
+    });
+
+  if (map.getLayer("hist-label")) return;
   map.addLayer({
-    id: "coarse-fill",
-    type: "fill",
-    source: "hist-coarse",
-    maxzoom: OHM_MINZOOM,
-    paint: {
-      "fill-color": "#64748b",
-      "fill-outline-color": "#94a3b8",
-      "fill-opacity": [
-        "interpolate", ["linear"], ["zoom"],
-        OHM_MINZOOM - 1, 0.35,
-        OHM_MINZOOM, 0,
-      ],
-    },
-  });
-
-  map.addSource("hist-ohm", {
-    type: "vector",
-    tiles: [OHM_TILES],
-    minzoom: OHM_MINZOOM,
-    maxzoom: 12,
-    // These tiles carry no feature ids, so feature-state hover would have
-    // nothing to key on without this. osm_id is unique per feature (verified
-    // 980/980) and stable across tile boundaries, so a country split across two
-    // tiles highlights as one shape.
-    promoteId: "osm_id",
-    attribution: "© OpenHistoricalMap",
-  });
-
-  const f = dateFilter(currentDate);
-
-  map.addLayer({
-    id: "ohm-fill",
-    type: "fill",
-    source: "hist-ohm",
-    "source-layer": "boundaries",
-    filter: f,
-    paint: {
-      "fill-color": [
-        "case",
-        ["has", "disputed_by"], "#d97706",
-        ["==", ["get", "admin_level"], 2], "#e5e7eb",
-        "#94a3b8",
-      ],
-      // The zoom interpolate MUST be outermost: MapLibre rejects a ["zoom"]
-      // nested inside anything else. So the hover branch is repeated per stop
-      // rather than wrapping the curve.
-      "fill-opacity": [
-        "interpolate", ["linear"], ["zoom"],
-        5, ["case", ["boolean", ["feature-state", "hover"], false], 0.35, 0.06],
-        10, ["case", ["boolean", ["feature-state", "hover"], false], 0.35, 0.12],
-      ],
-    },
-  });
-
-  map.addLayer({
-    id: "ohm-line",
-    type: "line",
-    source: "hist-ohm",
-    "source-layer": "boundaries",
-    filter: f,
-    paint: {
-      "line-color": [
-        "case",
-        ["has", "disputed_by"], "#f59e0b",
-        ["==", ["get", "admin_level"], 2], "#f8fafc",
-        "#cbd5e1",
-      ],
-      "line-width": [
-        "interpolate", ["linear"], ["zoom"],
-        5, ["case", ["==", ["get", "admin_level"], 2], 1.1, 0.4],
-        10, ["case", ["==", ["get", "admin_level"], 2], 2.4, 1],
-      ],
-      "line-opacity": 0.9,
-    },
-  });
-
-  map.addLayer({
-    id: "ohm-label",
+    id: "hist-label",
     type: "symbol",
-    source: "hist-ohm",
-    "source-layer": "boundaries",
-    filter: f,
-    minzoom: OHM_MINZOOM,
+    source: "hist-labels",
     layout: {
-      // "point" placement puts one label at MapLibre's pole of inaccessibility —
-      // always inside the polygon, unlike a centroid, which lands offshore for
-      // anything crescent-shaped.
-      "symbol-placement": "point",
       "text-field": labelText,
       // Noto Sans Bold is NOT in the Protomaps glyph set; it 404s. Medium is.
       "text-font": ["Noto Sans Medium"],
-      "text-size": ["interpolate", ["linear"], ["zoom"], 5, 11, 10, 15],
+      "text-size": ["interpolate", ["linear"], ["zoom"], 2, 10, 10, 15],
       "text-line-height": 1.15,
       "text-padding": 4,
-      // The readability fix. Collisions resolve automatically instead of every
-      // name drawing over every other one, and the biggest polity wins because
-      // sort-key is ascending.
+      // Collisions resolve automatically instead of every name drawing over
+      // every other one, and the biggest polity wins because sort-key ascends.
       "text-allow-overlap": false,
       "icon-allow-overlap": false,
       "symbol-sort-key": ["-", 0, ["coalesce", ["get", "area"], 0]],
-      // Flags are registered lazily as "flag:<name>"; ["image"] resolves to null
-      // when one is missing, so the label silently degrades to text-only.
-      "icon-image": ["image", ["concat", "flag:", ["get", "name"]]],
-      "icon-size": ["interpolate", ["linear"], ["zoom"], 5, 0.5, 10, 0.85],
+      // Flags are registered lazily as "flag:<osm_id>"; ["image"] resolves to
+      // null when one is missing, so the label degrades to text-only.
+      "icon-image": ["image", ["concat", "flag:", ["get", "osm_id"]]],
+      "icon-size": ["interpolate", ["linear"], ["zoom"], 2, 0.4, 10, 0.85],
       // Flag sits above the block; the text hangs off the icon's bottom edge.
       "icon-anchor": "bottom",
       "text-anchor": "top",
@@ -322,11 +294,37 @@ function addHistoryLayers() {
   });
 }
 
+/** Enable/disable sources at runtime. Rebuilds the style when needed. */
+export async function setSources(ids: string[]) {
+  const hadToday = enabled.includes("today");
+  enabled = ids;
+  saveSources(ids);
+
+  for (const s of SOURCES) {
+    if (ids.includes(s.id)) continue;
+    for (const l of s.layers) if (map.getLayer(l)) map.removeLayer(l);
+  }
+  // The present-day source is basemap layers we normally strip, so toggling it
+  // means rebuilding the style rather than adding a layer.
+  if (hadToday !== ids.includes("today")) return setBasemap(savedBasemap());
+
+  for (const s of SOURCES) {
+    if (!ids.includes(s.id)) continue;
+    if (s.layers.length && s.layers.some((l) => map.getLayer(l))) continue;
+    await s.attach(map, "hist-label");
+  }
+  applyFilters();
+  queueLabels();
+}
+
+
 export async function initMap(
   container: HTMLDivElement,
   onPick: (p: Picked | null) => void,
 ): Promise<maplibregl.Map> {
   maplibregl.addProtocol("pmtiles", new Protocol().tile);
+  enabled = savedSources();
+  await detectOhm();
 
   map = new maplibregl.Map({
     container,
@@ -339,24 +337,30 @@ export async function initMap(
     canvasContextAttributes: { preserveDrawingBuffer: true, antialias: true },
   });
 
+  // Double-click means "drill into this territory", not "zoom". Leaving the
+  // native handler on made it zoom first, so by the time the drill read the
+  // cursor it was over a city district rather than the country.
+  map.doubleClickZoom.disable();
+
   // Without this, a bad style or tile URL fails completely silently.
   map.on("error", (e) => console.error("maplibre:", e.error?.message ?? e));
 
   await map.once("load");
-  addHistoryLayers();
-  // Re-add after every setStyle, for as long as the map lives. addHistoryLayers
+  await addHistoryLayers();
+  // Re-add after every setStyle, for as long as the map lives. The function
   // returns immediately when the layers are already there, so the repeats that
   // styledata fires per tile batch cost nothing.
-  map.on("styledata", addHistoryLayers);
+  map.on("styledata", () => void addHistoryLayers());
 
   bindHover();
   bindClick(onPick);
-  // NOT "idle": it never fires while tiles keep streaming, so flags never
-  // loaded. moveend covers panning, sourcedata covers the first tiles arriving
-  // and every date change, and the debounce collapses the burst of both.
-  map.on("moveend", queueFlags);
-  map.on("sourcedata", queueFlags);
-  queueFlags();
+  map.on("moveend", queueLabels);
+  // Must exclude our own label source. rebuildLabels() calls setData on it,
+  // which fires sourcedata, which re-queued the rebuild — a loop that never
+  // settled, burning CPU and making every video frame wait out its timeout.
+  map.on("sourcedata", (e) => {
+    if (e.sourceId !== "hist-labels") queueLabels();
+  });
 
   const saved = savedBasemap();
   if (saved !== "dark") setBasemap(saved);
@@ -366,151 +370,322 @@ export async function initMap(
 }
 
 // ---------------------------------------------------------------------------
-// Interaction — OHM only. The coarse layer is never queried.
+// Interaction
 // ---------------------------------------------------------------------------
 
-const state = (id: string | number) => ({
-  source: "hist-ohm",
-  sourceLayer: "boundaries",
-  id,
-});
+const stateRef = (source: string, sourceLayer: string | undefined, id: string | number) =>
+  sourceLayer ? { source, sourceLayer, id } : { source, id };
+
+const SRC_OF: Record<string, [string, string | undefined]> = {
+  "ohm-fill": ["hist-ohm", "boundaries"],
+  "hb-fill": ["hist-hb", undefined],
+  "cs-fill": ["hist-cs", undefined],
+};
 
 function bindHover() {
-  let hot: string | number | undefined;
+  let hot: { layer: string; id: string | number } | null = null;
   const clear = () => {
-    if (hot !== undefined) map.setFeatureState(state(hot), { hover: false });
-    hot = undefined;
+    if (hot) {
+      const [src, sl] = SRC_OF[hot.layer] ?? [];
+      if (src) map.setFeatureState(stateRef(src, sl, hot.id), { hover: false });
+    }
+    hot = null;
   };
 
-  map.on("mousemove", "ohm-fill", (e) => {
-    const f = smallest(e.features);
-    if (!f || f.id === hot) return;
+  map.on("mousemove", (e) => {
+    const hit = topmost(e.point);
+    if (!hit || hit.f.id === undefined) {
+      clear();
+      map.getCanvas().style.cursor = "";
+      return;
+    }
+    if (hot && hot.id === hit.f.id && hot.layer === hit.layer) return;
     clear();
-    hot = f.id;
-    if (hot !== undefined) map.setFeatureState(state(hot), { hover: true });
+    const [src, sl] = SRC_OF[hit.layer] ?? [];
+    if (src) {
+      hot = { layer: hit.layer, id: hit.f.id };
+      map.setFeatureState(stateRef(src, sl, hit.f.id), { hover: true });
+    }
     map.getCanvas().style.cursor = "pointer";
   });
 
-  map.on("mouseleave", "ohm-fill", () => {
-    clear();
-    map.getCanvas().style.cursor = "";
-  });
+  map.on("mouseout", clear);
 }
 
 /**
- * Smallest by area. Boundaries nest — a click inside a province hits the
- * province, its country and any empire above it — and the innermost one is what
- * the pointer is actually on.
+ * The feature under the cursor, from the highest-priority enabled source that
+ * has one. Within a source, the smallest by area — boundaries nest, and the
+ * innermost is what the pointer is on. Focus keeps the deeper levels hidden
+ * until you drill in, so this no longer steals the country's click.
  */
-function smallest(features?: maplibregl.MapGeoJSONFeature[]) {
-  if (!features?.length) return undefined;
-  return [...features].sort(
-    (a, b) =>
-      Number(a.properties?.area ?? Infinity) -
-      Number(b.properties?.area ?? Infinity),
-  )[0];
+function topmost(point: maplibregl.PointLike) {
+  for (const s of pickable()) {
+    const hits = map.queryRenderedFeatures(point, { layers: [s.pickLayer] });
+    if (!hits.length) continue;
+    const f = [...hits].sort(
+      (a, b) =>
+        Number(a.properties?.area ?? Infinity) -
+        Number(b.properties?.area ?? Infinity),
+    )[0];
+    return { layer: s.pickLayer, source: s, f };
+  }
+  return null;
 }
+
+function toPicked(p: Record<string, any>): Picked {
+  return {
+    osmId: Number(p.osm_id),
+    name: p["name:en"] || p.name || "Unnamed",
+    adminLevel: Number(p.admin_level) || undefined,
+    startDate: p.start_date || undefined,
+    endDate: p.end_date || undefined,
+    // Our own tiles carry these, so a click needs no Overpass round trip.
+    qid: typeof p.wikidata === "string" ? p.wikidata : undefined,
+    wikipedia: typeof p.wikipedia === "string" ? p.wikipedia : undefined,
+  };
+}
+
+const onKeyDown = (e: KeyboardEvent) => {
+  if (e.key === "Escape" && focus.trail.length) drillOut(focus.trail.length - 1);
+};
 
 function bindClick(onPick: (p: Picked | null) => void) {
   map.on("click", (e) => {
-    const p = smallest(
-      map.queryRenderedFeatures(e.point, { layers: ["ohm-fill"] }),
-    )?.properties;
-    if (!p) return onPick(null);
-    onPick({
-      osmId: Number(p.osm_id),
-      name: p["name:en"] || p.name || "Unnamed",
-      adminLevel: Number(p.admin_level) || undefined,
-      startDate: p.start_date || undefined,
-      endDate: p.end_date || undefined,
-    });
+    const hit = topmost(e.point);
+    onPick(hit?.f.properties ? toPicked(hit.f.properties) : null);
   });
+
+  map.on("dblclick", (e) => {
+    const hit = topmost(e.point);
+    if (!hit?.f.properties) return;
+    void drillInto(toPicked(hit.f.properties));
+  });
+
+  // Named + removed first: initMap re-runs under HMR, and an anonymous listener
+  // would accumulate one Escape handler per edit.
+  document.removeEventListener("keydown", onKeyDown);
+  document.addEventListener("keydown", onKeyDown);
 }
 
 // ---------------------------------------------------------------------------
-// Flags
+// Drill-down
 // ---------------------------------------------------------------------------
 
-// ponytail: 30 per idle, national boundaries only. Beyond that you get
-// text-only labels until you pan. Raise the cap only if that reads as a bug.
-const FLAG_CAP = 30;
-const asked = new Set<string>();
+const notify = () => onFocusChange?.({ ...focus, trail: [...focus.trail] });
 
-// sourcedata fires per tile, so coalesce the burst into one pass.
-let flagTimer: ReturnType<typeof setTimeout> | undefined;
-function queueFlags() {
-  clearTimeout(flagTimer);
-  flagTimer = setTimeout(() => void loadFlags(), 400);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Wait until the camera has stopped AND the tiles for the new view have arrived.
+ *
+ * `once("idle")` alone is not enough and caused a real bug: fitBounds animates
+ * for 700ms, idle fired while the old view was still up, so childIds found none
+ * of the parent's polygons, the allow-list came back empty, and every
+ * neighbouring country's provinces stayed on screen.
+ */
+export async function whenIdle(timeoutMs = 12000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (map.isMoving() || map.isZooming() || map.isEasing()) {
+      await Promise.race([map.once("moveend"), sleep(200)]);
+      continue;
+    }
+    if (!map.loaded() || !map.areTilesLoaded()) {
+      await Promise.race([map.once("idle"), sleep(200)]);
+      continue;
+    }
+    return;
+  }
 }
 
 /**
- * Resolve flags for the countries currently on screen, in three batched hops:
- * one Overpass call maps every osm_id to its `wikidata` tag, one Wikidata fetch
- * per Q-id gives the flag filename, and one Commons call turns all of those
- * filenames into CORS-readable thumbnail URLs.
+ * Focus a polity and reveal the level below it.
+ *
+ * Bounds come from Overpass, which returns them alongside the wikidata tag we
+ * already ask for — the tiles only carry clipped geometry, so a feature's true
+ * extent is not otherwise knowable.
+ */
+export async function drillInto(p: Picked) {
+  // Idempotent: a double-click can deliver two events, and the SideSheet button
+  // hits the same path, so re-focusing the current polity must not stack a
+  // second identical crumb on the trail.
+  const tip = focus.trail[focus.trail.length - 1];
+  if (tip?.osmId === p.osmId) return;
+  const level = p.adminLevel ?? 2;
+  await fetchTags([p.osmId]);
+  const b = cachedBounds(p.osmId);
+  if (b) {
+    map.fitBounds([b.minlon, b.minlat, b.maxlon, b.maxlat], {
+      padding: 60,
+      duration: 700,
+    });
+  }
+
+  focus = {
+    trail: [...focus.trail, { osmId: p.osmId, name: p.name, adminLevel: level }],
+    // Provisional: opened one notch so children can be found, then narrowed to
+    // the level that actually exists here once tiles for the new view land.
+    maxLevel: level + 2,
+    allow: null,
+  };
+  applyFilters();
+  notify();
+
+  if (!b) return;
+  await whenIdle();
+  const src = pickable()[0];
+  if (!src) return;
+  const { ids, counts } = childIds(map, src.pickLayer, p.osmId, level);
+  focus = {
+    ...focus,
+    maxLevel: nextLevel(level, counts),
+    allow: ids.length ? ids : null,
+  };
+  applyFilters();
+  queueLabels();
+  notify();
+}
+
+/** Pop back to `index` in the trail; -1 returns to the country view. */
+export function drillOut(index: number) {
+  const trail = focus.trail.slice(0, Math.max(0, index));
+  const level = trail.length ? trail[trail.length - 1].adminLevel : 2;
+  focus = { trail, maxLevel: trail.length ? level + 2 : 2, allow: null };
+  applyFilters();
+  queueLabels();
+  notify();
+  const last = trail[trail.length - 1];
+  const b = last && cachedBounds(last.osmId);
+  if (b)
+    map.fitBounds([b.minlon, b.minlat, b.maxlon, b.maxlat], {
+      padding: 60,
+      duration: 700,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Labels + flags
+// ---------------------------------------------------------------------------
+
+let labelTimer: ReturnType<typeof setTimeout> | undefined;
+let labelsPending = 0;
+
+/** sourcedata fires per tile, so coalesce the burst into one pass. */
+function queueLabels() {
+  clearTimeout(labelTimer);
+  labelsPending++;
+  labelTimer = setTimeout(() => {
+    rebuildLabels();
+    labelsPending = 0;
+    void loadFlags();
+  }, 250);
+}
+
+/** True when nothing is queued — the video renderer waits on this. */
+export const labelsSettled = () => labelsPending === 0 && flagsInFlight === 0;
+
+function rebuildLabels() {
+  const src = map?.getSource?.("hist-labels") as maplibregl.GeoJSONSource | undefined;
+  if (!src) return;
+
+  // Prefer the pipeline's precomputed points: they come from unclipped geometry,
+  // so they are exact rather than "largest piece currently on screen".
+  const s = pickable()[0];
+  const layer =
+    s && s.labelLayer && map.getLayer(s.labelLayer) ? s.labelLayer : s?.pickLayer;
+  if (!layer) return src.setData({ type: "FeatureCollection", features: [] });
+
+  src.setData(buildLabelPoints(map.queryRenderedFeatures({ layers: [layer] })) as never);
+}
+
+// ponytail: 30 flags per pass, national boundaries only. Beyond that you get
+// text-only labels until you pan. Raise the cap only if that reads as a bug.
+const FLAG_CAP = 30;
+const asked = new Set<number>();
+let flagsInFlight = 0;
+
+/**
+ * Flags for the countries on screen, in three batched hops: one Overpass call
+ * maps osm_ids to wikidata tags (skipped entirely when our own tiles already
+ * carry them), one Wikidata fetch per Q-id for the filename, and one Commons
+ * call turning all of those into CORS-readable thumbnail URLs.
  */
 async function loadFlags() {
-  if (!map.getLayer("ohm-label")) return;
+  if (!map.getLayer("hist-label")) return;
   const feats = map
-    .queryRenderedFeatures({ layers: ["ohm-label"] })
+    .queryRenderedFeatures({ layers: ["hist-label"] })
     .filter(
       (f) =>
         Number(f.properties?.admin_level) === 2 &&
-        f.properties?.name &&
-        !asked.has(f.properties.name),
+        f.properties?.osm_id &&
+        !asked.has(Number(f.properties.osm_id)),
     )
     .slice(0, FLAG_CAP);
   if (!feats.length) return;
 
-  for (const f of feats) asked.add(f.properties!.name);
-  await fetchTags(feats.map((f) => Number(f.properties?.osm_id)));
+  flagsInFlight++;
+  try {
+    for (const f of feats) asked.add(Number(f.properties!.osm_id));
+    // Our tiles bake in `wikidata`; the hosted ones do not, hence the fallback.
+    const missing = feats
+      .filter((f) => !f.properties?.wikidata)
+      .map((f) => Number(f.properties?.osm_id));
+    if (missing.length) await fetchTags(missing);
 
-  // name -> flag filename, for the ones that have both a Q-id and a P41.
-  const wanted = new Map<string, string>();
-  await Promise.all(
-    feats.map(async (f) => {
-      const name = f.properties!.name as string;
-      const qid = qidOf(cachedTags(Number(f.properties?.osm_id)));
-      if (!qid || map.hasImage(`flag:${name}`)) return;
-      const file = await flagFileFor(qid, currentDate);
-      if (file) wanted.set(name, normFile(file));
-    }),
-  );
-  if (!wanted.size) return;
+    const wanted = new Map<number, string>();
+    await Promise.all(
+      feats.map(async (f) => {
+        const id = Number(f.properties?.osm_id);
+        const qid =
+          (f.properties?.wikidata as string) || qidOf(cachedTags(id)) || "";
+        if (!/^Q\d+$/.test(qid) || map.hasImage(`flag:${id}`)) return;
+        const file = await flagFileFor(qid, currentDate);
+        if (file) wanted.set(id, normFile(file));
+      }),
+    );
+    if (!wanted.size) return;
 
-  const urls = await thumbUrls([...new Set(wanted.values())]);
-  await Promise.all(
-    [...wanted].map(async ([name, file]) => {
-      const url = urls.get(file);
-      const key = `flag:${name}`;
-      if (!url || map.hasImage(key)) return;
-      try {
-        const bitmap = await createImageBitmap(await (await fetch(url)).blob());
-        if (!map.hasImage(key)) map.addImage(key, bitmap);
-      } catch {
-        // A polity with no usable flag is normal. It stays text-only, and
-        // `asked` means we never look again.
-      }
-    }),
-  );
+    const urls = await thumbUrls([...new Set(wanted.values())]);
+    await Promise.all(
+      [...wanted].map(async ([id, file]) => {
+        const url = urls.get(file);
+        const key = `flag:${id}`;
+        if (!url || map.hasImage(key)) return;
+        try {
+          const bitmap = await createImageBitmap(await (await fetch(url)).blob());
+          if (!map.hasImage(key)) map.addImage(key, bitmap);
+        } catch {
+          // A polity with no usable flag is normal. It stays text-only, and
+          // `asked` means we never look again.
+        }
+      }),
+    );
+  } finally {
+    flagsInFlight--;
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Coarse underlay, projection, export
+// Historical-Basemaps data, projection, export
 // ---------------------------------------------------------------------------
 
-/** Swap the sub-zoom-5 backdrop. Visual only — nothing reads these features. */
+/** Swap the Historical-Basemaps snapshot. Visual+pickable, but coarse. */
 export function setCoarse(data: unknown) {
-  coarse = data;
-  (map?.getSource("hist-coarse") as maplibregl.GeoJSONSource | undefined)?.setData(
-    data as never,
+  // Stamp name/admin_level/osm_id: this dataset carries none of them, and the
+  // shared date and hierarchy filters need all three.
+  coarse = normaliseHB(data);
+  (map?.getSource("hist-hb") as maplibregl.GeoJSONSource | undefined)?.setData(
+    coarse as never,
   );
+  queueLabels();
 }
 
 /** Globe or flat. MapLibre 5 only — and only safe now that deck.gl is gone. */
 export function setGlobe(on: boolean) {
   map.setProjection({ type: on ? "globe" : "mercator" });
 }
+
+export { ohmIsLocal, ohmMinZoom };
 
 function download(blob: Blob, ext: string) {
   const a = document.createElement("a");
@@ -538,10 +713,12 @@ export function exportPng(width = 3840) {
   map.triggerRepaint();
 }
 
+export { download };
+
 /**
- * Records the live canvas. MediaRecorder emits real MP4/H.264 in current Chrome,
- * so there is no ffmpeg.wasm here; browsers without it fall back to WebM, which
- * every video editor still reads.
+ * Records the live canvas in real time. Kept only as the fallback for browsers
+ * without WebCodecs — it samples whatever is on screen, so a tile that arrives
+ * late is recorded as a stutter. src/video.ts is the good path.
  */
 export function startRecording(fps = 30) {
   const mime =

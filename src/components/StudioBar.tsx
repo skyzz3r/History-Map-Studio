@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { exportPng, map, startRecording } from "../map.ts";
+import { canRenderOffline, renderSequence } from "../video.ts";
 import { applyIndex, getIndex } from "../scrub.ts";
 import { duration, play, type Camera, type Key } from "../keyframes.ts";
 import { formatYear, yearAt } from "../borders.ts";
@@ -15,9 +16,13 @@ export default function StudioBar({
 }) {
   const [playing, setPlaying] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
+  const [width, setWidth] = useState(1920);
   const stop = useRef<(() => void) | null>(null);
+  const abort = useRef<AbortController | null>(null);
 
   useEffect(() => () => stop.current?.(), []);
+  const offline = canRenderOffline();
 
   const tick = (cam: Camera) => {
     map.jumpTo({
@@ -29,9 +34,38 @@ export default function StudioBar({
     applyIndex(Math.min(cam.index, max), true); // time-travel is keyframed too
   };
 
-  // Recording just runs the sequence with the canvas wired to a MediaRecorder,
-  // so whatever plays back is exactly what lands in the file.
-  const record = () => {
+  /**
+   * Offline render: every frame waits for the map to actually be loaded before
+   * it is encoded, so the file is identical on a fast connection and a throttled
+   * one. This is the good path — `recordLive` only exists for browsers without
+   * WebCodecs.
+   */
+  const render = async () => {
+    if (keys.length < 2 || recording) return;
+    setRecording(true);
+    abort.current = new AbortController();
+    try {
+      const n = await renderSequence({
+        keys,
+        width,
+        maxIndex: max,
+        signal: abort.current.signal,
+        onProgress: (d, t) => setProgress(`${d}/${t}`),
+      });
+      setProgress(`${n} frames`);
+    } catch (e) {
+      setProgress(`failed: ${e}`);
+      console.error(e);
+    } finally {
+      setRecording(false);
+      abort.current = null;
+      setTimeout(() => setProgress(null), 4000);
+    }
+  };
+
+  // Real-time capture. Records whatever is on screen, so a tile that loads late
+  // lands in the file as a stutter — kept only where WebCodecs is missing.
+  const recordLive = () => {
     if (keys.length < 2 || recording) return;
     setRecording(true);
     const finish = startRecording();
@@ -90,21 +124,51 @@ export default function StudioBar({
         >
           Export 4K PNG
         </button>
+        <select
+          value={width}
+          onChange={(e) => setWidth(+e.target.value)}
+          aria-label="Video resolution"
+          disabled={recording}
+          className="rounded-lg border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
+        >
+          <option value={1280}>720p</option>
+          <option value={1920}>1080p</option>
+          <option value={2560}>1440p</option>
+          <option value={3840}>4K</option>
+        </select>
         <button
-          onClick={record}
+          onClick={offline ? render : recordLive}
           disabled={keys.length < 2 || recording || playing}
           className="rounded-lg bg-neutral-800 px-3 py-1.5 text-sm text-red-300 disabled:opacity-30"
+          title={
+            offline
+              ? "Renders frame by frame, waiting for every tile — output does not depend on connection speed"
+              : "This browser lacks WebCodecs; falls back to real-time capture, which can stutter"
+          }
         >
-          {recording ? "Recording…" : "Record video"}
+          {recording
+            ? `Rendering… ${progress ?? ""}`
+            : offline
+              ? "Render video"
+              : "Record video (live)"}
         </button>
+        {recording && (
+          <button
+            onClick={() => abort.current?.abort()}
+            className="rounded-lg px-3 py-1.5 text-sm text-neutral-400 hover:bg-neutral-800"
+          >
+            Cancel
+          </button>
+        )}
         <button
           onClick={() => setKeys([])}
-          disabled={!keys.length}
+          disabled={!keys.length || recording}
           className="rounded-lg px-3 py-1.5 text-sm text-neutral-400 disabled:opacity-30 hover:bg-neutral-800"
         >
           Clear
         </button>
         <span className="ml-auto font-mono text-xs text-neutral-500">
+          {progress && !recording ? `${progress} · ` : ""}
           {keys.length} keys · {duration(keys).toFixed(1)}s
         </span>
       </div>

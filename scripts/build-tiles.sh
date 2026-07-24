@@ -1,66 +1,96 @@
 #!/usr/bin/env bash
 # Build world-historical.pmtiles from the OpenHistoricalMap planet dump.
 #
-# NOT run by default, and not needed to run the app: OHM already serves these
-# tiles at vtiles.openhistoricalmap.org with CORS open to our origin, and
-# src/map.ts points there. Build this only if you want to self-host, pin a
-# version, or work offline.
+# Normally run in CI (.github/workflows/tiles.yml), not by hand: it needs
+# osmium-tool and tippecanoe, neither of which has a Windows build.
 #
-# Requires osmium-tool and tippecanoe. Neither has a Windows build, so on
-# Windows run this inside WSL:
-#   sudo apt install osmium-tool tippecanoe
-# Budget ~30 GB of free scratch space; the GeoJSON stage is far larger than
-# the compressed input.
+# Why self-host at all: OHM's hosted tiles ship ~300 name_* localisations per
+# feature with no per-zoom simplification, so a z3 tile is 4.7 MB and the app
+# has to gate itself to zoom 5+. Stripping those fields and letting tippecanoe
+# simplify per zoom is what removes the gate.
 set -euo pipefail
 
 BUCKET="https://s3.amazonaws.com/planet.openhistoricalmap.org"
 OUT="${OUT:-public/basemaps/world-historical.pmtiles}"
 WORK="${WORK:-./.tilework}"
+# GitHub Pages refuses files over 100 MB, and the app reads this file from the
+# same origin, so it has to fit. 95 leaves headroom.
+LIMIT_MB="${LIMIT_MB:-95}"
 mkdir -p "$WORK" "$(dirname "$OUT")"
 
-# 1. Fetch the newest planet dump (~1.1 GB, rebuilt daily).
+# 1. Newest planet dump (~1.14 GB, rebuilt daily).
+#
+# The bucket listing is PAGINATED: a single max-keys request returns a stale
+# newest key (it reported a 2023 file when the real newest was today's), so
+# follow the continuation token to the end.
 if [ ! -f "$WORK/planet.osm.pbf" ]; then
-  KEY=$(curl -s "$BUCKET?list-type=2&max-keys=1000&prefix=planet/planet" \
-        | tr '>' '>\n' | grep -oE 'Key>planet/planet-[0-9_]+\.osm\.pbf' \
-        | sed 's/^Key>//' | sort | tail -1)
+  echo "==> finding newest planet"
+  TOKEN=""; KEY=""
+  while :; do
+    RESP=$(curl -s "$BUCKET?list-type=2&max-keys=1000&prefix=planet/planet${TOKEN}")
+    FOUND=$(printf '%s' "$RESP" | tr '>' '>\n' \
+            | grep -oE 'Key>planet/planet-[0-9_]+\.osm\.pbf' \
+            | sed 's/^Key>//' | sort | tail -1)
+    [ -n "$FOUND" ] && KEY="$FOUND"
+    NEXT=$(printf '%s' "$RESP" | grep -oE '<NextContinuationToken>[^<]+' | sed 's/.*>//')
+    [ -z "$NEXT" ] && break
+    TOKEN="&continuation-token=$(printf '%s' "$NEXT" | sed 's/+/%2B/g; s|/|%2F|g; s/=/%3D/g')"
+  done
+  [ -n "$KEY" ] || { echo "!! could not find a planet dump"; exit 1; }
   echo "==> fetching $KEY"
   curl -# -o "$WORK/planet.osm.pbf" "$BUCKET/$KEY"
 fi
 
-# 2. Keep only administrative boundaries.
+# 2+3. Filter to boundaries and convert to GeoJSONSeq, STREAMED.
 #
-# NOT `historic=yes`: that tag appears on exactly ONE administrative boundary in
-# all of OHM (checked via Overpass). Everything in OHM is historic by
-# definition, so filtering on it yields an empty extract. This filter keeps
-# ~182k features, ~96k of which carry start_date.
-echo "==> osmium tags-filter"
-osmium tags-filter --overwrite -o "$WORK/filtered.osm.pbf" \
-  "$WORK/planet.osm.pbf" wr/boundary=administrative
+# NOT `historic=yes`: that tag is on exactly ONE administrative boundary in all
+# of OHM (checked via Overpass). Everything in OHM is historic by definition.
+#
+# The pipe matters. Writing filtered.osm.pbf and then a planet-wide GeoJSON
+# needed ~30 GB of scratch; osmium streams one stage into the next, so only the
+# boundary subset ever touches disk. tippecanoe cannot read .osm.pbf, so the
+# export stage is required either way.
+if [ ! -f "$WORK/prepared.geojsonseq" ]; then
+  echo "==> filter + export + prepare (streamed)"
+  osmium tags-filter -o - -f pbf "$WORK/planet.osm.pbf" wr/boundary=administrative \
+    | osmium export -f geojsonseq --attributes=id,type - \
+    | node --experimental-strip-types scripts/prepare.mjs \
+    > "$WORK/prepared.geojsonseq"
+fi
+echo "==> prepared $(du -m "$WORK/prepared.geojsonseq" | cut -f1) MB"
 
-# 3. PBF -> GeoJSONSeq. tippecanoe cannot read .osm.pbf; its inputs are
-#    GeoJSON, GeoJSONSeq, FlatGeobuf and CSV. Without this stage step 4 fails.
-echo "==> osmium export"
-osmium export --overwrite -f geojsonseq \
-  --attributes=id,type -o "$WORK/borders.geojsonseq" "$WORK/filtered.osm.pbf"
+# 4. Compile, stepping the maxzoom down until it fits.
+#
+# Output size cannot be known before building, and silently shipping a truncated
+# tileset would look like missing data. So try the best zoom first and SAY which
+# one we landed on.
+#   -P   parallel input (the RS-separated stream allows it)
+#   -Z0  keep tiles all the way out to the world view: this is the zoom gate
+#        being removed, and label points carry minzoom 0 from prepare.mjs
+FINAL_Z=""
+for Z in 12 10 8; do
+  echo "==> tippecanoe -z$Z"
+  tippecanoe -o "$OUT" --force -P -Z0 -z"$Z" \
+    --drop-densest-as-needed --no-tile-size-limit \
+    "$WORK/prepared.geojsonseq"
+  SIZE=$(du -m "$OUT" | cut -f1)
+  echo "==> z$Z -> ${SIZE} MB"
+  if [ "$SIZE" -le "$LIMIT_MB" ]; then FINAL_Z="$Z"; break; fi
+  echo "!! over ${LIMIT_MB} MB, retrying at a lower maxzoom"
+done
 
-# 4. Dates -> numbers. MapLibre expressions cannot compare "1942-05-12"
-#    mathematically, and a missing date must become a sentinel rather than null:
-#    null fails every numeric comparison and would silently hide the feature.
-echo "==> numeric dates"
-node --experimental-strip-types scripts/decimal-dates.mjs \
-  < "$WORK/borders.geojsonseq" > "$WORK/borders-dated.geojsonseq"
-
-# 5. Compile. -zg picks the zoom range; --drop-densest-as-needed keeps dense
-#    areas from blowing the per-tile limit.
-echo "==> tippecanoe"
-tippecanoe -o "$OUT" --force -zg --drop-densest-as-needed \
-  -l boundaries "$WORK/borders-dated.geojsonseq"
-
-SIZE=$(du -m "$OUT" | cut -f1)
-echo "==> $OUT is ${SIZE} MB"
-[ "$SIZE" -gt 100 ] && cat <<'WARN'
-!! Over 100 MB: GitHub Pages rejects files that large, so this cannot ship in
-!! the repo. Either host it on R2/S3 and point BASEMAP_OHM at that, or keep
-!! using OHM's own tile server (the current default).
+if [ -z "$FINAL_Z" ]; then
+  cat <<WARN
+!! Could not fit under ${LIMIT_MB} MB even at z8.
+!! GitHub Pages will reject this file. Options: host it on Cloudflare R2 (free
+!! tier, CORS configurable) and point OHM_TILES at that, or narrow the extract
+!! (e.g. admin_level<=4). Leaving the z8 build in place for inspection.
 WARN
-exit 0
+  exit 1
+fi
+
+echo "===================================================="
+echo "  $OUT"
+echo "  $(du -m "$OUT" | cut -f1) MB, zoom 0-${FINAL_Z}"
+[ "$FINAL_Z" -lt 12 ] && echo "  NOTE: capped at z$FINAL_Z to fit; detail above that zoom is lost."
+echo "===================================================="

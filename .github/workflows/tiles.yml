@@ -1,0 +1,58 @@
+name: Build history tiles
+
+# Manual, plus monthly so the tiles do not silently rot. NOT on push: this
+# downloads a 1.14 GB planet dump and takes tens of minutes.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 1 * *" # 04:00 UTC on the 1st
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tiles
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install osmium + tippecanoe
+        run: sudo apt-get update && sudo apt-get install -y osmium-tool tippecanoe
+
+      - name: Show free disk
+        run: df -h / | tail -1
+
+      - name: Build
+        run: bash scripts/build-tiles.sh
+
+      # The .pmtiles is tens of MB and would be rewritten every month, so it
+      # does NOT go on main — a year of monthly commits would be ~1 GB of git
+      # history for a file nobody diffs. It lives on an orphan branch that is
+      # force-pushed, so exactly one copy ever exists, and the deploy workflow
+      # checks that branch out into public/ before building.
+      - name: Publish to the `tiles` branch
+        run: |
+          SIZE=$(du -m public/basemaps/*.pmtiles | cut -f1)
+          cd public/basemaps
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b tiles
+          git add -f ./*.pmtiles
+          git commit -q -m "tiles: rebuild (${SIZE} MB)"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" tiles
+
+      - name: Summary
+        run: |
+          echo "### History tiles rebuilt" >> $GITHUB_STEP_SUMMARY
+          ls -lh public/basemaps/*.pmtiles | awk '{print "- `"$9"` **"$5"**"}' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Deploy to pick them up: run **Deploy to Pages**." >> $GITHUB_STEP_SUMMARY

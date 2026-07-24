@@ -20,6 +20,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Built by the "Build history tiles" workflow and force-pushed to an
+      # orphan `tiles` branch, so it never bloats main's history. Absent on a
+      # fresh clone or before the first tile build — the app detects that at
+      # runtime and falls back to OHM's hosted tiles, so this must not fail.
+      - name: Fetch prebuilt history tiles (optional)
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: tiles
+          path: .tiles
+
+      - name: Stage tiles into public/
+        run: |
+          if compgen -G ".tiles/*.pmtiles" > /dev/null; then
+            mkdir -p public/basemaps && cp .tiles/*.pmtiles public/basemaps/
+            ls -lh public/basemaps/
+          else
+            echo "no prebuilt tiles; app will use OHM's hosted tiles"
+          fi
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
