@@ -154,14 +154,21 @@ fi
 FINAL_Z=""
 for Z in 10 8 6; do
   say "tippecanoe -z$Z"
-  # -r1 disables tippecanoe's DEFAULT drop rate, and it is not optional here.
-  # That default thins features by ~2.5x per zoom below the maxzoom, which is
-  # invisible until the maxzoom moves: the z6 build kept 52,845 boundaries in
-  # its z0 tile, and the very next build — identical except that it reached z10
-  # — kept TWO, because z0 was suddenly ten levels down (2.5^10 ~ 9500x).
-  # Which features to carry at low zoom is decided by admin_level in
-  # prepare.mjs, deliberately; tippecanoe must not also decimate them.
-  tippecanoe -o "$OUT" --force -P -Z0 -z"$Z" -l boundaries -r1 \
+  # These flags are the ones that MEASURABLY produced a working tileset (77 MB,
+  # z0-6, 52,845 boundaries in the z0 tile). Two attempts to improve on them
+  # both failed, and both are recorded here so they are not retried blind:
+  #
+  #   * per-feature minzoom by admin_level let the build reach z10, and the z0
+  #     tile came out holding TWO features. Something in tippecanoe's low-zoom
+  #     reduction scales with the distance below maxzoom.
+  #   * -r1, to stop that reduction, made tippecanoe keep every feature at
+  #     every zoom; it died during "Reordering geometry" at 25%.
+  #
+  # Diagnosing which of tippecanoe's several reduction mechanisms is
+  # responsible needs a local tippecanoe to experiment against. Until then this
+  # stays on the known-good setting rather than costing another 20-minute run
+  # per guess.
+  tippecanoe -o "$OUT" --force -P -Z0 -z"$Z" -l boundaries \
     --drop-densest-as-needed --no-tile-size-limit \
     "$WORK/prepared.geojsonseq"
   SIZE=$(du -m "$OUT" | cut -f1)

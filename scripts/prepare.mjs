@@ -105,15 +105,19 @@ export function osmIdOf(f) {
 /**
  * The lowest zoom a feature is worth carrying, by admin_level.
  *
- * Measured on the first successful build: a single z0 tile held 52,845
- * boundaries. Era filtering happens at RUNTIME, so every historical boundary
- * that ever existed sits in every tile at every zoom — 77 MB was only reachable
- * by letting the maxzoom ladder fall from 10 to 6, and the label points were
- * dropped entirely to fit.
+ * CURRENTLY UNUSED — kept because the idea is sound and the measurement is
+ * worth not repeating. Era filtering happens at RUNTIME, so every historical
+ * boundary that ever existed sits in every tile at every zoom: one z0 tile held
+ * 52,845 of them. Withholding provinces from the world view should be free,
+ * since the app's drill-down does not reveal levels below 2 until you focus a
+ * country.
  *
- * A Prussian province has no business being in the world view. The app's own
- * drill-down does not reveal levels below 2 until you focus a country, so
- * withholding them at low zoom costs nothing that is ever displayed.
+ * What actually happened: it shrank the input enough that the maxzoom ladder
+ * reached z10 instead of z6, and at z10 the z0 tile came back with TWO
+ * features. Whatever tippecanoe does to reduce low-zoom detail scales with the
+ * distance below maxzoom, and -r1 (which stops it) made tippecanoe die during
+ * "Reordering geometry". Re-enable only alongside a local tippecanoe to
+ * experiment against.
  */
 export function minZoomFor(adminLevel) {
   const al = Number(adminLevel) || 0;
@@ -230,7 +234,11 @@ export function transform(f) {
       type: "Feature",
       geometry: f.geometry,
       properties: props,
-      tippecanoe: { layer: "boundaries", minzoom: minZoomFor(props.admin_level) },
+      // No per-feature minzoom. Gating by admin_level was tried and reverted:
+      // it shrank the input enough for the ladder to reach z10, and at z10 the
+      // z0 tile came back holding two features instead of tens of thousands.
+      // See minZoomFor below — kept, unused, with the measurement.
+      tippecanoe: { layer: "boundaries" },
     },
   ];
 }

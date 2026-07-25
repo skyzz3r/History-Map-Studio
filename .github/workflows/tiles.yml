@@ -47,7 +47,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .tilework
-          key: tilework-v3
+          key: tilework-v4
 
       - name: Prepare (download, filter, export)
         run: bash scripts/build-tiles.sh prepare
@@ -61,7 +61,7 @@ jobs:
         continue-on-error: true
         with:
           path: .tilework
-          key: tilework-v3
+          key: tilework-v4
 
       - name: Compile tiles
         run: bash scripts/build-tiles.sh compile
