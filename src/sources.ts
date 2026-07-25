@@ -72,11 +72,32 @@ export type OhmTiles = {
   spec: { url: string } | { tiles: string[] };
 };
 
+/**
+ * KILL SWITCH for the self-hosted archive. Set false while the published
+ * tileset is not trustworthy.
+ *
+ * Currently FALSE. The tileset on the `tiles` branch is the one from build #6,
+ * whose z0 tile contains two features — a maritime line and a town in Alaska —
+ * because tippecanoe's low-zoom reduction scales with distance below maxzoom
+ * and that build reached z10. Pushing an unrelated fix to main redeployed
+ * Pages, which checks the `tiles` branch out at build time, so the broken
+ * archive went live.
+ *
+ * The hosted OHM tiles are gated to zoom 5 but they are CORRECT, which beats a
+ * blank world map. Flip back to true once a build passes the z0 feature check
+ * in scripts/build-tiles.sh.
+ */
+const USE_LOCAL_TILES = false;
+
 let ohmTiles: OhmTiles | null = null;
 
 /** Detected once. Lets the app work before the CI tile build has ever run. */
 export async function detectOhm(): Promise<OhmTiles> {
   if (ohmTiles) return ohmTiles;
+  if (!USE_LOCAL_TILES) {
+    ohmTiles = { local: false, minzoom: 5, spec: { tiles: [OHM_HOSTED] } };
+    return ohmTiles;
+  }
   try {
     const r = await fetch(OHM_LOCAL, { method: "HEAD" });
     // A missing file on GitHub Pages returns the 404 page as 200 text/html, so
