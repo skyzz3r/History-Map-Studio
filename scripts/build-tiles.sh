@@ -154,11 +154,30 @@ fi
 FINAL_Z=""
 for Z in 10 8 6; do
   say "tippecanoe -z$Z"
-  tippecanoe -o "$OUT" --force -P -Z0 -z"$Z" -l boundaries \
+  # -r1 disables tippecanoe's DEFAULT drop rate, and it is not optional here.
+  # That default thins features by ~2.5x per zoom below the maxzoom, which is
+  # invisible until the maxzoom moves: the z6 build kept 52,845 boundaries in
+  # its z0 tile, and the very next build — identical except that it reached z10
+  # — kept TWO, because z0 was suddenly ten levels down (2.5^10 ~ 9500x).
+  # Which features to carry at low zoom is decided by admin_level in
+  # prepare.mjs, deliberately; tippecanoe must not also decimate them.
+  tippecanoe -o "$OUT" --force -P -Z0 -z"$Z" -l boundaries -r1 \
     --drop-densest-as-needed --no-tile-size-limit \
     "$WORK/prepared.geojsonseq"
   SIZE=$(du -m "$OUT" | cut -f1)
   say "z$Z -> ${SIZE} MB"
+
+  # Count what is ACTUALLY in the world tile. The earlier guard counted lines in
+  # prepared.geojsonseq, which says nothing about what survived tiling — it
+  # passed happily on a tileset whose z0 tile held two features, one of them a
+  # maritime line and the other a town in Alaska.
+  Z0=$(tippecanoe-decode "$OUT" 0 0 0 2>/dev/null | grep -c '"osm_id"' || true)
+  say "z$Z -> z0 tile carries ${Z0} features"
+  if [ "$Z0" -lt 500 ]; then
+    echo "!! z0 tile is nearly empty — refusing to publish"
+    exit 1
+  fi
+
   if [ "$SIZE" -le "$LIMIT_MB" ]; then FINAL_Z="$Z"; break; fi
   echo "!! over ${LIMIT_MB} MB, retrying at a lower maxzoom"
 done
