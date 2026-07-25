@@ -17,7 +17,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # 350, not 180: run #3 spent over two hours inside the Build step before
+    # tippecanoe had even reported a size, and tippecanoe can run three times
+    # (z12, z10, z8) when the output does not fit under the Pages 100 MB cap.
+    # 360 is the hosted-runner maximum.
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -30,8 +34,32 @@ jobs:
       - name: Show free disk
         run: df -h / | tail -1
 
-      - name: Build
-        run: bash scripts/build-tiles.sh
+      # Restore whatever a previous run got through. Every stage in the script
+      # is guarded by "if its output file is missing", so this is a no-op for
+      # anything already done and a full rebuild when there is nothing to
+      # restore.
+      - name: Restore tile work
+        uses: actions/cache/restore@v4
+        with:
+          path: .tilework
+          key: tilework-v1
+
+      - name: Prepare (download, filter, export)
+        run: bash scripts/build-tiles.sh prepare
+
+      # An EXPLICIT save, not the cache action's automatic post step: that post
+      # step does not run when a job is killed for timeout, which is exactly the
+      # case worth protecting against here. Saving between the two halves means
+      # a tippecanoe timeout costs only tippecanoe.
+      - name: Save tile work
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: .tilework
+          key: tilework-v1
+
+      - name: Compile tiles
+        run: bash scripts/build-tiles.sh compile
 
       # The .pmtiles is tens of MB and would be rewritten every month, so it
       # does NOT go on main — a year of monthly commits would be ~1 GB of git

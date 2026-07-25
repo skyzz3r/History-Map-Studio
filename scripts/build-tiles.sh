@@ -18,13 +18,30 @@ WORK="${WORK:-./.tilework}"
 LIMIT_MB="${LIMIT_MB:-95}"
 mkdir -p "$WORK" "$(dirname "$OUT")"
 
+# Run #3 sat inside this script for over two hours with no output at all, so
+# there was no way to tell osmium's area assembly apart from tippecanoe, or
+# either from a hang. Every stage announces itself with a wall clock and an
+# elapsed count from here on.
+T0=$(date +%s)
+say() { printf '==> [%s, +%dm] %s\n' "$(date -u +%H:%M:%S)" "$((($(date +%s) - T0) / 60))" "$*"; }
+
+# Optional stage: "prepare" stops after prepared.geojsonseq, "compile" assumes
+# it exists. Splitting the two lets CI cache the expensive half BETWEEN them —
+# a cache action's post step never runs when a job is killed for timeout, so
+# without an explicit save point in the middle, a run that dies in tippecanoe
+# throws away the download, the filter and the export as well.
+#
+# Every stage is already guarded by "if the output file is missing", so running
+# the whole script twice is a no-op on the parts that finished.
+STAGE="${1:-all}"
+
 # 1. Newest planet dump (~1.14 GB, rebuilt daily).
 #
 # The bucket listing is PAGINATED: a single max-keys request returns a stale
 # newest key (it reported a 2023 file when the real newest was today's), so
 # follow the continuation token to the end.
 if [ ! -f "$WORK/planet.osm.pbf" ]; then
-  echo "==> finding newest planet"
+  say "finding newest planet"
   #
   # Every test below is a full if/then and every grep ends in `|| true`. That is
   # not style. Under `set -e`, a bare `[ cond ] && action` is a STATEMENT whose
@@ -53,11 +70,11 @@ if [ ! -f "$WORK/planet.osm.pbf" ]; then
     printf '%s' "$RESP" | head -c 400; echo
     exit 1
   fi
-  echo "==> fetching $KEY"
+  say "fetching $KEY"
   # Silent: the progress bar emitted 200 lines of hashes into the CI log and
   # buried the only messages worth reading.
   curl -sS --retry 3 -o "$WORK/planet.osm.pbf" "$BUCKET/$KEY"
-  echo "==> downloaded $(du -m "$WORK/planet.osm.pbf" | cut -f1) MB"
+  say "downloaded $(du -m "$WORK/planet.osm.pbf" | cut -f1) MB"
 fi
 
 # 2+3. Filter to boundaries and convert to GeoJSONSeq, STREAMED.
@@ -86,27 +103,32 @@ fi
 # -> file stage stays a pipe, which is where the space actually went.
 if [ ! -f "$WORK/prepared.geojsonseq" ]; then
   if [ ! -f "$WORK/bounds.osm.pbf" ]; then
-    echo "==> filter to boundaries"
+    say "filter to boundaries"
     osmium tags-filter --overwrite -o "$WORK/bounds.osm.pbf" -f pbf \
       "$WORK/planet.osm.pbf" \
       wr/boundary=administrative,political,military \
       wr/military=occupation_zone \
       wr/border_type=demilitarized_zone
   fi
-  echo "==> filtered $(du -m "$WORK/bounds.osm.pbf" | cut -f1) MB"
+  say "filtered $(du -m "$WORK/bounds.osm.pbf" | cut -f1) MB"
 
-  echo "==> export + prepare"
+  say "export + prepare"
   osmium export "$WORK/bounds.osm.pbf" -f geojsonseq --attributes=id,type \
     | node --experimental-strip-types scripts/prepare.mjs \
     > "$WORK/prepared.geojsonseq"
 fi
 PREPARED_LINES=$(wc -l < "$WORK/prepared.geojsonseq")
-echo "==> prepared $(du -m "$WORK/prepared.geojsonseq" | cut -f1) MB, $PREPARED_LINES features"
+say "prepared $(du -m "$WORK/prepared.geojsonseq" | cut -f1) MB, $PREPARED_LINES features"
 # tippecanoe is perfectly happy to build an empty tileset, and an empty tileset
 # looks exactly like "the app cannot reach the tiles". Fail here instead.
 if [ "$PREPARED_LINES" -lt 1000 ]; then
   echo "!! implausibly few features — refusing to publish an empty tileset"
   exit 1
+fi
+
+if [ "$STAGE" = "prepare" ]; then
+  say "stage 'prepare' complete"
+  exit 0
 fi
 
 # 4. Compile, stepping the maxzoom down until it fits.
@@ -119,12 +141,12 @@ fi
 #        being removed, and label points carry minzoom 0 from prepare.mjs
 FINAL_Z=""
 for Z in 12 10 8; do
-  echo "==> tippecanoe -z$Z"
+  say "tippecanoe -z$Z"
   tippecanoe -o "$OUT" --force -P -Z0 -z"$Z" \
     --drop-densest-as-needed --no-tile-size-limit \
     "$WORK/prepared.geojsonseq"
   SIZE=$(du -m "$OUT" | cut -f1)
-  echo "==> z$Z -> ${SIZE} MB"
+  say "z$Z -> ${SIZE} MB"
   if [ "$SIZE" -le "$LIMIT_MB" ]; then FINAL_Z="$Z"; break; fi
   echo "!! over ${LIMIT_MB} MB, retrying at a lower maxzoom"
 done
