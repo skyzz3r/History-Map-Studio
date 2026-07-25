@@ -54,7 +54,10 @@ if [ ! -f "$WORK/planet.osm.pbf" ]; then
     exit 1
   fi
   echo "==> fetching $KEY"
-  curl -# -o "$WORK/planet.osm.pbf" "$BUCKET/$KEY"
+  # Silent: the progress bar emitted 200 lines of hashes into the CI log and
+  # buried the only messages worth reading.
+  curl -sS --retry 3 -o "$WORK/planet.osm.pbf" "$BUCKET/$KEY"
+  echo "==> downloaded $(du -m "$WORK/planet.osm.pbf" | cut -f1) MB"
 fi
 
 # 2+3. Filter to boundaries and convert to GeoJSONSeq, STREAMED.
@@ -70,21 +73,41 @@ fi
 # 0, border_type=demilitarized_zone 0. They are in the extract so the occupation
 # overlay has somewhere to draw from when OHM tagging catches up.
 #
-# The pipe matters. Writing filtered.osm.pbf and then a planet-wide GeoJSON
-# needed ~30 GB of scratch; osmium streams one stage into the next, so only the
-# boundary subset ever touches disk. tippecanoe cannot read .osm.pbf, so the
-# export stage is required either way.
+# The filter output goes to a FILE, not a pipe.
+#
+# `osmium export` cannot consume a pipe here for two independent reasons: it
+# cannot sniff the format of stdin ("When reading from STDIN you need to use the
+# --input-format/-F option"), and assembling boundary relations into polygons
+# needs more than one look at the data, which a pipe cannot give.
+#
+# The thing worth avoiding was never this file — it is the planet-wide GeoJSON,
+# which needed ~30 GB. The filtered PBF is only the boundary subset, so it is at
+# most as big as the 1.14 GB planet and usually far smaller. The export -> node
+# -> file stage stays a pipe, which is where the space actually went.
 if [ ! -f "$WORK/prepared.geojsonseq" ]; then
-  echo "==> filter + export + prepare (streamed)"
-  osmium tags-filter -o - -f pbf "$WORK/planet.osm.pbf" \
-    wr/boundary=administrative,political,military \
-    wr/military=occupation_zone \
-    wr/border_type=demilitarized_zone \
-    | osmium export -f geojsonseq --attributes=id,type - \
+  if [ ! -f "$WORK/bounds.osm.pbf" ]; then
+    echo "==> filter to boundaries"
+    osmium tags-filter --overwrite -o "$WORK/bounds.osm.pbf" -f pbf \
+      "$WORK/planet.osm.pbf" \
+      wr/boundary=administrative,political,military \
+      wr/military=occupation_zone \
+      wr/border_type=demilitarized_zone
+  fi
+  echo "==> filtered $(du -m "$WORK/bounds.osm.pbf" | cut -f1) MB"
+
+  echo "==> export + prepare"
+  osmium export "$WORK/bounds.osm.pbf" -f geojsonseq --attributes=id,type \
     | node --experimental-strip-types scripts/prepare.mjs \
     > "$WORK/prepared.geojsonseq"
 fi
-echo "==> prepared $(du -m "$WORK/prepared.geojsonseq" | cut -f1) MB"
+PREPARED_LINES=$(wc -l < "$WORK/prepared.geojsonseq")
+echo "==> prepared $(du -m "$WORK/prepared.geojsonseq" | cut -f1) MB, $PREPARED_LINES features"
+# tippecanoe is perfectly happy to build an empty tileset, and an empty tileset
+# looks exactly like "the app cannot reach the tiles". Fail here instead.
+if [ "$PREPARED_LINES" -lt 1000 ]; then
+  echo "!! implausibly few features — refusing to publish an empty tileset"
+  exit 1
+fi
 
 # 4. Compile, stepping the maxzoom down until it fits.
 #
