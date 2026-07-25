@@ -25,18 +25,34 @@ mkdir -p "$WORK" "$(dirname "$OUT")"
 # follow the continuation token to the end.
 if [ ! -f "$WORK/planet.osm.pbf" ]; then
   echo "==> finding newest planet"
-  TOKEN=""; KEY=""
+  #
+  # Every test below is a full if/then and every grep ends in `|| true`. That is
+  # not style. Under `set -e`, a bare `[ cond ] && action` is a STATEMENT whose
+  # exit status is the test's, so it aborts the script whenever the condition is
+  # false — `[ -z "$NEXT" ] && break` killed the very first run here after page
+  # one, in 0s, printing nothing at all. `grep` exiting 1 on no-match does the
+  # same through pipefail.
+  TOKEN=""; KEY=""; PAGE=0
   while :; do
-    RESP=$(curl -s "$BUCKET?list-type=2&max-keys=1000&prefix=planet/planet${TOKEN}")
-    FOUND=$(printf '%s' "$RESP" | tr '>' '>\n' \
-            | grep -oE 'Key>planet/planet-[0-9_]+\.osm\.pbf' \
-            | sed 's/^Key>//' | sort | tail -1)
-    [ -n "$FOUND" ] && KEY="$FOUND"
-    NEXT=$(printf '%s' "$RESP" | grep -oE '<NextContinuationToken>[^<]+' | sed 's/.*>//')
-    [ -z "$NEXT" ] && break
+    PAGE=$((PAGE + 1))
+    if ! RESP=$(curl -sS --retry 3 --retry-delay 2 --max-time 120 \
+                 "$BUCKET?list-type=2&max-keys=1000&prefix=planet/planet${TOKEN}"); then
+      echo "!! listing page $PAGE failed (curl exit $?)"; exit 1
+    fi
+    FOUND=$(printf '%s' "$RESP" | grep -oE 'planet/planet-[0-9_]+\.osm\.pbf' \
+            | sort | tail -1 || true)
+    if [ -n "$FOUND" ]; then KEY="$FOUND"; fi
+    NEXT=$(printf '%s' "$RESP" | grep -oE '<NextContinuationToken>[^<]+' \
+           | sed 's/.*>//' || true)
+    echo "    page $PAGE: newest so far ${KEY:-none}"
+    if [ -z "$NEXT" ]; then break; fi
     TOKEN="&continuation-token=$(printf '%s' "$NEXT" | sed 's/+/%2B/g; s|/|%2F|g; s/=/%3D/g')"
   done
-  [ -n "$KEY" ] || { echo "!! could not find a planet dump"; exit 1; }
+  if [ -z "$KEY" ]; then
+    echo "!! no planet dump in the listing; first 400 bytes of the last page:"
+    printf '%s' "$RESP" | head -c 400; echo
+    exit 1
+  fi
   echo "==> fetching $KEY"
   curl -# -o "$WORK/planet.osm.pbf" "$BUCKET/$KEY"
 fi
@@ -103,5 +119,9 @@ fi
 echo "===================================================="
 echo "  $OUT"
 echo "  $(du -m "$OUT" | cut -f1) MB, zoom 0-${FINAL_Z}"
-[ "$FINAL_Z" -lt 12 ] && echo "  NOTE: capped at z$FINAL_Z to fit; detail above that zoom is lost."
+# if/then, not `&&`: at z12 the test is false, and under `set -e` that would
+# fail the job on the last line after a completely successful build.
+if [ "$FINAL_Z" -lt 12 ]; then
+  echo "  NOTE: capped at z$FINAL_Z to fit; detail above that zoom is lost."
+fi
 echo "===================================================="
