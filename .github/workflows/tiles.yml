@@ -38,11 +38,16 @@ jobs:
       # is guarded by "if its output file is missing", so this is a no-op for
       # anything already done and a full rebuild when there is nothing to
       # restore.
+      #
+      # BUMP THIS KEY whenever prepare.mjs changes what it writes. The guards
+      # mean a stale prepared.geojsonseq is silently reused — v1 holds the
+      # un-simplified 8.3 GB stream, and restoring it would quietly undo the
+      # thinning that makes the compile step finish at all.
       - name: Restore tile work
         uses: actions/cache/restore@v4
         with:
           path: .tilework
-          key: tilework-v1
+          key: tilework-v2
 
       - name: Prepare (download, filter, export)
         run: bash scripts/build-tiles.sh prepare
@@ -56,7 +61,7 @@ jobs:
         continue-on-error: true
         with:
           path: .tilework
-          key: tilework-v1
+          key: tilework-v2
 
       - name: Compile tiles
         run: bash scripts/build-tiles.sh compile

@@ -12,6 +12,7 @@ import {
   insideGeometry,
   labelPoint,
   pointOnSurface,
+  simplify,
 } from "./geo.ts";
 import { buildLabelPoints } from "./labels.ts";
 import { bboxArea, claimsFrom, overlappingIds, type Sample } from "./claims.ts";
@@ -421,6 +422,29 @@ assert.equal(featureArea({ type: "Point", coordinates: [0, 0] }), 0);
 assert.deepEqual(mergeAllow([1, 2], [2, 3]).sort(), [1, 2, 3]);
 assert.deepEqual(mergeAllow(null, [4, 4]), [4]);
 assert.deepEqual(mergeAllow([1], []), [1], "an empty pass must not clear the list");
+
+// --- simplify: the pipeline's only defence against 8.3 GB of coastline ---
+// A straight run of collinear points must collapse to its endpoints...
+const straight = [[0, 0], [1, 0], [2, 0], [3, 0], [4, 0], [5, 0]];
+assert.deepEqual(simplify(straight, 1e-4), [[0, 0], [5, 0]], "collinear collapses");
+// ...but a real deviation above the tolerance must survive.
+const bumpy = [[0, 0], [1, 0], [2, 1], [3, 0], [4, 0]];
+assert.ok(
+  simplify(bumpy, 0.1).some((p) => p[1] === 1),
+  "a deviation larger than the tolerance is kept",
+);
+// `bumpy` is an open line, not a closed ring, so collapsing to its two
+// endpoints is correct. The 4-position floor applies only to closed rings —
+// applying it to lines is what made simplify() hand back the full input.
+assert.equal(simplify(bumpy, 5).length, 2, "an open line may collapse to 2");
+// A closed ring's first and last positions coincide, which makes the
+// anchor-to-anchor segment degenerate; distance must not become NaN and throw
+// the whole ring away.
+const ring = [...box(0, 0, 1, 1)];
+assert.ok(simplify(ring, 1e-9).length >= 4, "closed rings survive");
+assert.deepEqual(simplify([[0, 0], [1, 1]], 0.5), [[0, 0], [1, 1]], "too short to touch");
+// The output must stay a valid ring rather than degenerate into a line.
+assert.ok(simplify(ring, 100).length >= 4, "never returns fewer than 4 positions");
 
 // --- the tile pipeline's id signing ---
 // Relations MUST come out negative: src/ohm.ts turns a negative osm_id into an

@@ -108,6 +108,65 @@ export function insideGeometry(pt: number[], g: any): boolean {
   return false;
 }
 
+/**
+ * Douglas-Peucker, in degrees, iterative so a 100k-vertex coastline cannot
+ * blow the stack.
+ *
+ * Why the tile pipeline needs this at all: the OHM planet's boundary subset
+ * exports to 8.3 GB of GeoJSON for 203,705 features — about 1900 vertices each,
+ * because historical borders follow coastlines at full OSM resolution.
+ * tippecanoe then spends hours reordering that; measured, it reached 3% of the
+ * reorder in two and a half hours. Its own per-zoom simplification happens
+ * AFTER the reorder, so it cannot help with the cost of getting there.
+ *
+ * A tolerance below half a pixel at the target maxzoom is invisible: at z10 one
+ * pixel is ~1.37e-3 degrees, so 5e-4 is roughly a third of a pixel.
+ */
+export function simplify(ring: Ring, tol: number): Ring {
+  if (ring.length < 3) return ring;
+  const keep = new Uint8Array(ring.length);
+  keep[0] = keep[ring.length - 1] = 1;
+  const stack: [number, number][] = [[0, ring.length - 1]];
+
+  while (stack.length) {
+    const [lo, hi] = stack.pop()!;
+    if (hi - lo < 2) continue;
+    const [ax, ay] = ring[lo];
+    const [bx, by] = ring[hi];
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len = Math.hypot(dx, dy);
+    let far = -1;
+    let best = tol;
+    for (let i = lo + 1; i < hi; i++) {
+      const [px, py] = ring[i];
+      // Degenerate segment (a closed ring's endpoints coincide): fall back to
+      // straight distance from the anchor, or every vertex collapses to one.
+      const d = len
+        ? Math.abs(dy * px - dx * py + bx * ay - by * ax) / len
+        : Math.hypot(px - ax, py - ay);
+      if (d > best) [best, far] = [d, i];
+    }
+    if (far < 0) continue;
+    keep[far] = 1;
+    stack.push([lo, far], [far, hi]);
+  }
+
+  const out: Ring = [];
+  for (let i = 0; i < ring.length; i++) if (keep[i]) out.push(ring[i]);
+
+  // A CLOSED ring needs 4 positions to still be a ring, so hand back the
+  // original rather than emit a polygon tippecanoe would reject. An open line
+  // is perfectly valid with 2, and applying the ring rule to it returned the
+  // full unsimplified input — which is the whole thing this exists to avoid.
+  const closed =
+    ring.length > 3 &&
+    ring[0][0] === ring[ring.length - 1][0] &&
+    ring[0][1] === ring[ring.length - 1][1];
+  const floor = closed ? 4 : 2;
+  return out.length >= floor ? out : ring;
+}
+
 /** Total |area| of a feature's outer rings. Used to rank nested picks. */
 export function featureArea(g: any): number {
   let a = 0;

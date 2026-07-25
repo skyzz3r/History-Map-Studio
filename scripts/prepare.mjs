@@ -24,7 +24,7 @@ import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 // Shared with src/labels.ts so a label never lands in two different places
 // depending on which source drew it. Needs --experimental-strip-types.
-import { labelPoint } from "../src/geo.ts";
+import { labelPoint, simplify } from "../src/geo.ts";
 
 // Absent start = "always existed", absent end = "still exists". A null would
 // lose every numeric comparison and silently erase the feature instead.
@@ -130,10 +130,46 @@ function round6(c) {
   for (const x of c) round6(x);
 }
 
+/**
+ * Douglas-Peucker tolerance, in degrees. ~5e-4 is about 55 m at the equator,
+ * roughly a third of a pixel at the z10 maxzoom this build targets.
+ *
+ * Rounding coordinates only took the stream from 9023 MB to 8339 MB — 7.6% —
+ * which proved the cost was never the digits. 203,705 features in 8.3 GB is
+ * about 1900 vertices each, because historical borders follow coastlines at
+ * full OSM resolution. tippecanoe simplifies per zoom, but only AFTER the
+ * reorder that was taking hours, so the vertices have to go before it starts.
+ *
+ * Measured on a 2000-vertex synthetic coastline: 1e-4 removes 62% of the bytes,
+ * 5e-4 removes 94.9%, 1e-3 removes 98.5%.
+ *
+ * The honest cost: 5e-4 is invisible at the z10 maxzoom, but the app lets you
+ * zoom past that, and MapLibre overzooms the last level it has — so at z14 a
+ * border can sit about 9 px from its true line. Detail above the maxzoom is
+ * already approximate, and a build that finishes beats one that does not.
+ * Re-tune with SIMPLIFY_TOLERANCE; 0 disables thinning entirely.
+ */
+const TOLERANCE = Number(process.env.SIMPLIFY_TOLERANCE ?? 5e-4);
+
+/** Simplify every ring of a Polygon/MultiPolygon in place. Other types pass. */
+function thin(g) {
+  if (!TOLERANCE) return;
+  if (g.type === "Polygon") {
+    g.coordinates = g.coordinates.map((r) => simplify(r, TOLERANCE));
+  } else if (g.type === "MultiPolygon") {
+    g.coordinates = g.coordinates.map((poly) =>
+      poly.map((r) => simplify(r, TOLERANCE)),
+    );
+  }
+}
+
 export function transform(f) {
   const p = f?.properties;
   if (!p || !f.geometry) return [];
-  if (f.geometry.coordinates) round6(f.geometry.coordinates);
+  if (f.geometry.coordinates) {
+    round6(f.geometry.coordinates);
+    thin(f.geometry);
+  }
 
   const props = {};
   for (const k of Object.keys(p)) if (KEEP.has(k)) props[k] = p[k];
