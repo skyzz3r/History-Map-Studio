@@ -139,17 +139,13 @@ const ohm: Source = {
   // the side sheet's "Also here" list.
   pickLayers: ["ohm-occupation", "ohm-fill", "ohm-claim"],
   claimLayer: "ohm-claim",
-  // Our own build ships a pre-computed one-point-per-polity layer; the hosted
-  // tiles have no such layer, so labels fall back to deduping the polygons.
-  labelLayer: "ohm-labelsrc",
-  layers: [
-    "ohm-fill",
-    "ohm-line",
-    "ohm-claim",
-    "ohm-claim-line",
-    "ohm-occupation",
-    "ohm-labelsrc",
-  ],
+  // No labelLayer. A pre-computed one-point-per-polity layer WAS built into our
+  // tiles, and tippecanoe's --drop-densest-as-needed threw it away to fit the
+  // tile budget — measured at exactly one label per tile at every zoom, which
+  // is worse than useless because the app preferred it over the working path.
+  // Labels are deduped client-side from the rendered polygons, the same code
+  // that already runs against OHM's hosted tiles.
+  layers: ["ohm-fill", "ohm-line", "ohm-claim", "ohm-claim-line", "ohm-occupation"],
 
   async attach(map, beforeId) {
     const t = await detectOhm();
@@ -273,22 +269,6 @@ const ohm: Source = {
       beforeId,
     );
 
-    // Invisible: it exists only so queryRenderedFeatures can read the label
-    // points our pipeline computed from unclipped geometry. The visible symbols
-    // are drawn from a GeoJSON source in labels.ts, because a tiled source
-    // cannot avoid labelling France once per tile.
-    if (t.local) {
-      map.addLayer(
-        {
-          id: "ohm-labelsrc",
-          type: "circle",
-          source: "hist-ohm",
-          "source-layer": "labels",
-          paint: { "circle-radius": 0, "circle-opacity": 0 },
-        },
-        beforeId,
-      );
-    }
   },
 };
 

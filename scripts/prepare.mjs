@@ -102,6 +102,27 @@ export function osmIdOf(f) {
   return isRelation ? -Math.abs(num) : Math.abs(num);
 }
 
+/**
+ * The lowest zoom a feature is worth carrying, by admin_level.
+ *
+ * Measured on the first successful build: a single z0 tile held 52,845
+ * boundaries. Era filtering happens at RUNTIME, so every historical boundary
+ * that ever existed sits in every tile at every zoom — 77 MB was only reachable
+ * by letting the maxzoom ladder fall from 10 to 6, and the label points were
+ * dropped entirely to fit.
+ *
+ * A Prussian province has no business being in the world view. The app's own
+ * drill-down does not reveal levels below 2 until you focus a country, so
+ * withholding them at low zoom costs nothing that is ever displayed.
+ */
+export function minZoomFor(adminLevel) {
+  const al = Number(adminLevel) || 0;
+  if (al <= 2) return 0; // countries: needed at the world view
+  if (al <= 4) return 4; // states / provinces
+  if (al <= 6) return 6; // districts / counties
+  return 8;
+}
+
 // --- transform ------------------------------------------------------------
 
 /**
@@ -195,23 +216,23 @@ export function transform(f) {
   const osmId = osmIdOf(f);
   if (osmId !== null) props.osm_id = osmId;
 
-  const out = [
-    { type: "Feature", geometry: f.geometry, properties: props,
-      tippecanoe: { layer: "boundaries" } },
-  ];
-
+  // The label point on the feature itself, so the client can rank polities
+  // without re-deriving it. Emitting a SEPARATE labels layer was tried and
+  // removed: tippecanoe's --drop-densest-as-needed sacrificed the points to fit
+  // the tile budget, leaving exactly ONE label per tile at every zoom. Labels
+  // are deduped client-side from the rendered polygons instead, which is what
+  // already runs against OHM's hosted tiles.
   const lp = labelPoint(f.geometry);
-  if (lp) {
-    out.push({
+  if (lp) props.area = Math.round(lp.area * 1e6);
+
+  return [
+    {
       type: "Feature",
-      geometry: { type: "Point", coordinates: lp.at },
-      // area drives symbol-sort-key, so the biggest polity wins a collision.
-      properties: { ...props, area: Math.round(lp.area * 1e6) },
-      // Label points must survive to z0; that is the whole point of the layer.
-      tippecanoe: { layer: "labels", minzoom: 0 },
-    });
-  }
-  return out;
+      geometry: f.geometry,
+      properties: props,
+      tippecanoe: { layer: "boundaries", minzoom: minZoomFor(props.admin_level) },
+    },
+  ];
 }
 
 // --- main -----------------------------------------------------------------
