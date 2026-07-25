@@ -31,6 +31,17 @@ export type Source = {
   restricted?: boolean;
   /** Layer that owns hover/click, or "" for reference-only sources. */
   pickLayer: string;
+  /** All hit-testable layers, highest priority first. Defaults to [pickLayer]. */
+  pickLayers?: string[];
+  /**
+   * Layer holding the de-jure claims split out of pickLayer.
+   *
+   * Overlap detection MUST hit-test pickLayer and this one together. Sampling
+   * pickLayer alone is self-defeating: the moment a feature is classified as a
+   * claim it leaves that layer, the next pass sees no overlap, and the
+   * classification flips back and forth forever.
+   */
+  claimLayer?: string;
   /** Layer whose features become labels. Falls back to pickLayer. */
   labelLayer?: string;
   /** Every layer this source owns, for date filtering and teardown. */
@@ -89,15 +100,56 @@ export async function detectOhm(): Promise<OhmTiles> {
 export const ohmIsLocal = () => ohmTiles?.local ?? false;
 export const ohmMinZoom = () => ohmTiles?.minzoom ?? 5;
 
+/** Registered by map.ts before the layers are added. See ensureHatch(). */
+export const HATCH = "hatch";
+
+/**
+ * Occupation-zone fill, atlas style.
+ *
+ * `occupant` is the OSM/OHM tag for who actually holds the ground;
+ * `controlled_by` is the older synonym still in use. Anything unrecognised gets
+ * neutral grey rather than vanishing.
+ *
+ * Honest scope: OHM currently has ZERO features tagged
+ * `military=occupation_zone` or `border_type=demilitarized_zone`, 3 tagged
+ * `boundary=military` and 14 `boundary=political` — so this renders almost
+ * nothing today, and nothing at all for Vichy France 1942. It is wired and
+ * correct; the data has to catch up.
+ */
+export const OCCUPANT_COLOR: any = [
+  "match",
+  ["coalesce", ["get", "occupant"], ["get", "controlled_by"], ""],
+  ["Germany", "Deutsches Reich", "German Reich"], "#dc2626",
+  ["Italy", "Regno d'Italia"], "#16a34a",
+  ["Soviet Union", "USSR"], "#b91c1c",
+  ["United Kingdom", "Britain"], "#2563eb",
+  ["United States", "USA"], "#0891b2",
+  ["France", "Free Zone", "Vichy France"], "#7c3aed",
+  ["Japan"], "#db2777",
+  "#9ca3af",
+];
+
 const ohm: Source = {
   id: "ohm",
   label: "OpenHistoricalMap",
   note: "ODbL. Day-level dates, strongest from 1600 on.",
   pickLayer: "ohm-fill",
+  // Order matters: this is also the hover/click priority. The de-facto polity
+  // must win the click, and the de-jure claim beneath it stays reachable from
+  // the side sheet's "Also here" list.
+  pickLayers: ["ohm-occupation", "ohm-fill", "ohm-claim"],
+  claimLayer: "ohm-claim",
   // Our own build ships a pre-computed one-point-per-polity layer; the hosted
   // tiles have no such layer, so labels fall back to deduping the polygons.
   labelLayer: "ohm-labelsrc",
-  layers: ["ohm-fill", "ohm-line", "ohm-labelsrc"],
+  layers: [
+    "ohm-fill",
+    "ohm-line",
+    "ohm-claim",
+    "ohm-claim-line",
+    "ohm-occupation",
+    "ohm-labelsrc",
+  ],
 
   async attach(map, beforeId) {
     const t = await detectOhm();
@@ -163,6 +215,58 @@ const ohm: Source = {
       beforeId,
     );
 
+    // The de-jure claim. Same source, complementary filter (map.ts owns both):
+    // no solid fill, a diagonal hatch instead, so where the Soviet Union still
+    // claimed German-occupied Lviv in 1942 you can read the de-facto border
+    // underneath rather than two translucent greys fighting.
+    map.addLayer(
+      {
+        id: "ohm-claim",
+        type: "fill",
+        source: "hist-ohm",
+        "source-layer": "boundaries",
+        paint: { "fill-pattern": HATCH, "fill-opacity": 0.5 },
+      },
+      beforeId,
+    );
+    map.addLayer(
+      {
+        id: "ohm-claim-line",
+        type: "line",
+        source: "hist-ohm",
+        "source-layer": "boundaries",
+        paint: {
+          "line-color": "#fbbf24",
+          "line-width": 1.2,
+          "line-dasharray": [3, 2],
+          "line-opacity": 0.8,
+        },
+      },
+      beforeId,
+    );
+
+    // Occupation zones / DMZs / political districts. Coloured by who holds the
+    // ground, atlas-style. Our own tiles stamp `overlay`; the hosted ones do not,
+    // so on hosted tiles this layer is simply always empty.
+    map.addLayer(
+      {
+        id: "ohm-occupation",
+        type: "fill",
+        source: "hist-ohm",
+        "source-layer": "boundaries",
+        paint: {
+          "fill-color": OCCUPANT_COLOR,
+          "fill-opacity": [
+            "case",
+            ["boolean", ["feature-state", "hover"], false], 0.6,
+            0.45,
+          ],
+          "fill-outline-color": "#0f172a",
+        },
+      },
+      beforeId,
+    );
+
     // Invisible: it exists only so queryRenderedFeatures can read the label
     // points our pipeline computed from unclipped geometry. The visible symbols
     // are drawn from a GeoJSON source in labels.ts, because a tiled source
@@ -216,6 +320,10 @@ const hb: Source = {
   layers: ["hb-fill", "hb-line"],
 
   attach(map, beforeId) {
+    // BELOW OHM, not above it. These layers used to be inserted before
+    // "hist-label", which put 4-vertex coarse borders on top of precise ones and
+    // made the real border unreadable wherever both sources had coverage.
+    if (map.getLayer("ohm-fill")) beforeId = "ohm-fill";
     map.addSource("hist-hb", {
       type: "geojson",
       data: { type: "FeatureCollection", features: [] },
@@ -361,7 +469,10 @@ const today: Source = {
 export const SOURCES: Source[] = [ohm, hb, cshapes, today];
 
 const STORE = "sources";
-const DEFAULT = ["ohm", "hb"];
+// OHM only. Having Historical-Basemaps on by default meant two disagreeing sets
+// of borders painted over each other everywhere OHM already had coverage; it is
+// worth enabling deliberately for ancient dates, not permanently.
+const DEFAULT = ["ohm"];
 
 export function savedSources(): string[] {
   try {

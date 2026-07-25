@@ -1,9 +1,16 @@
 import maplibregl, { type StyleSpecification } from "maplibre-gl";
 import { Protocol } from "pmtiles";
 import { layers, namedFlavor } from "@protomaps/basemaps";
-import { cachedBounds, cachedTags, fetchTags, qidOf } from "./ohm.ts";
+import {
+  cachedBounds,
+  cachedTags,
+  fetchTags,
+  qidOf,
+  type Bounds,
+} from "./ohm.ts";
 import { flagFileFor, normFile, thumbUrls } from "./wikidata.ts";
 import {
+  HATCH,
   SOURCES,
   dateFilter,
   detectOhm,
@@ -15,10 +22,13 @@ import {
   type Source,
 } from "./sources.ts";
 import { buildLabelPoints } from "./labels.ts";
+import { bboxArea, claimsFrom, overlappingIds, type Sample } from "./claims.ts";
+import { featureArea } from "./geo.ts";
 import {
   childIds,
   focusFilter,
   initialFocus,
+  mergeAllow,
   nextLevel,
   type FocusState,
 } from "./focus.ts";
@@ -52,6 +62,8 @@ let currentDate = -1e9;
 let enabled: string[] = [];
 let focus: FocusState = initialFocus();
 let onFocusChange: ((f: FocusState) => void) | null = null;
+/** osm_ids currently judged de-jure claims. Recomputed on the label pass. */
+let claims: unknown[] = [];
 
 export const getFocus = () => focus;
 export const bindFocusChange = (fn: (f: FocusState) => void) => {
@@ -78,6 +90,29 @@ const pickable = () =>
 // ---------------------------------------------------------------------------
 
 /**
+ * Layer-specific clauses on top of date + focus.
+ *
+ * The three OHM fill layers read the SAME source and partition it between them,
+ * so each needs the complement of the others or a claim would draw twice.
+ */
+function extraClause(layerId: string): any[] | null {
+  const isOverlay: any = ["==", ["coalesce", ["get", "overlay"], 0], 1];
+  const isClaim: any = ["in", ["get", "osm_id"], ["literal", claims]];
+  switch (layerId) {
+    case "ohm-occupation":
+      return [isOverlay];
+    case "ohm-fill":
+    case "ohm-line":
+      return [["!", isOverlay], ["!", isClaim]];
+    case "ohm-claim":
+    case "ohm-claim-line":
+      return [["!", isOverlay], isClaim];
+    default:
+      return null;
+  }
+}
+
+/**
  * Every filterable layer gets date AND focus. Pure GPU — no refetch.
  *
  * No isStyleLoaded() guard: that returns false while tiles are still streaming,
@@ -93,7 +128,11 @@ function applyFilters() {
       if (!map.getLayer(id)) continue;
       // The present-day source has no dates and no hierarchy; it is a reference
       // overlay, so filtering it would blank it.
-      map.setFilter(id, s.id === "today" ? null : ["all", date, f]);
+      if (s.id === "today") {
+        map.setFilter(id, null);
+        continue;
+      }
+      map.setFilter(id, ["all", date, f, ...(extraClause(id) ?? [])] as never);
     }
   }
   if (map.getLayer("hist-label")) map.setFilter("hist-label", ["all", date, f]);
@@ -230,6 +269,7 @@ async function addHistoryLayers() {
   if (attaching || map.getLayer("hist-label")) return;
   attaching = true;
   try {
+    ensureHatch();
     for (const s of active()) {
       if (s.layers.some((l) => map.getLayer(l))) continue;
       await s.attach(map);
@@ -241,6 +281,32 @@ async function addHistoryLayers() {
   } finally {
     attaching = false;
   }
+}
+
+/**
+ * The diagonal hatch the de-jure claim layer is filled with.
+ *
+ * Drawn rather than shipped: it is 16 lines of canvas against another network
+ * asset to host, cache-bust and 404. setStyle drops every registered image, so
+ * this is re-run from addHistoryLayers rather than once at startup.
+ */
+function ensureHatch() {
+  if (map.hasImage(HATCH)) return;
+  const n = 16;
+  const c = document.createElement("canvas");
+  c.width = c.height = n;
+  const g = c.getContext("2d");
+  if (!g) return;
+  g.strokeStyle = "#fbbf24";
+  g.lineWidth = 2.5;
+  g.beginPath();
+  // Three strokes, offset by ±n, so the diagonal is continuous when tiled.
+  for (const d of [-n, 0, n]) {
+    g.moveTo(d, n);
+    g.lineTo(d + n, 0);
+  }
+  g.stroke();
+  map.addImage(HATCH, g.getImageData(0, 0, n, n) as never, { pixelRatio: 2 });
 }
 
 /**
@@ -320,7 +386,7 @@ export async function setSources(ids: string[]) {
 
 export async function initMap(
   container: HTMLDivElement,
-  onPick: (p: Picked | null) => void,
+  onPick: (p: Picked | null, others: Picked[]) => void,
 ): Promise<maplibregl.Map> {
   maplibregl.addProtocol("pmtiles", new Protocol().tile);
   enabled = savedSources();
@@ -378,6 +444,8 @@ const stateRef = (source: string, sourceLayer: string | undefined, id: string | 
 
 const SRC_OF: Record<string, [string, string | undefined]> = {
   "ohm-fill": ["hist-ohm", "boundaries"],
+  "ohm-claim": ["hist-ohm", "boundaries"],
+  "ohm-occupation": ["hist-ohm", "boundaries"],
   "hb-fill": ["hist-hb", undefined],
   "cs-fill": ["hist-cs", undefined],
 };
@@ -412,25 +480,75 @@ function bindHover() {
   map.on("mouseout", clear);
 }
 
+export type Hit = {
+  layer: string;
+  source: Source;
+  f: maplibregl.MapGeoJSONFeature;
+};
+
 /**
- * The feature under the cursor, from the highest-priority enabled source that
- * has one. Within a source, the smallest by area — boundaries nest, and the
- * innermost is what the pointer is on. Focus keeps the deeper levels hidden
- * until you drill in, so this no longer steals the country's click.
+ * Everything under the cursor, best first, from the highest-priority enabled
+ * source that has anything.
+ *
+ * This used to sort on `f.properties.area` — a property that only ever exists on
+ * LABEL POINTS, never on boundary polygons. So every comparison was
+ * `Infinity - Infinity`, "smallest wins" silently degraded to "whatever the
+ * renderer happened to return first", and that one bug produced two of the
+ * reported symptoms: a drilled-into parent still stealing its children's clicks,
+ * and hovering an occupied region selecting the country around it.
+ *
+ * Ranking, in order:
+ *  1. Not an ancestor you already drilled through. Those stay drawn for context
+ *     but must stop being clickable, or the parent masks its own subdivisions.
+ *  2. Deepest admin_level — the innermost polity is what the pointer is on.
+ *  3. Not a de-jure claim, so the de-facto holder wins an overlap.
+ *  4. Smallest real area, computed from the rendered geometry.
  */
-function topmost(point: maplibregl.PointLike) {
+function hitsAt(point: maplibregl.PointLike): Hit[] {
+  const ancestors = new Set(focus.trail.map((t) => String(t.osmId)));
+  const isClaim = new Set(claims.map(String));
+
   for (const s of pickable()) {
-    const hits = map.queryRenderedFeatures(point, { layers: [s.pickLayer] });
-    if (!hits.length) continue;
-    const f = [...hits].sort(
-      (a, b) =>
-        Number(a.properties?.area ?? Infinity) -
-        Number(b.properties?.area ?? Infinity),
-    )[0];
-    return { layer: s.pickLayer, source: s, f };
+    const layers = (s.pickLayers ?? [s.pickLayer]).filter((l) => map.getLayer(l));
+    const raw = layers.length
+      ? map.queryRenderedFeatures(point, { layers })
+      : [];
+    if (!raw.length) continue;
+
+    // One entry per polity: tile clipping delivers the same feature several
+    // times and the side sheet must not list it twice.
+    const seen = new Map<string, { h: Hit; level: number; claim: boolean; area: number }>();
+    for (const f of raw) {
+      const id = String(f.properties?.osm_id ?? "");
+      if (seen.has(id)) continue;
+      const layer = layers.find((l) => l === f.layer?.id) ?? layers[0];
+      seen.set(id, {
+        h: { layer, source: s, f },
+        level: Number(f.properties?.admin_level) || 0,
+        claim: isClaim.has(id),
+        area: featureArea(f.geometry),
+      });
+    }
+
+    let list = [...seen.entries()];
+    // Only drop ancestors while something else remains — otherwise drilling into
+    // a country with no mapped subdivisions would make it unclickable.
+    const withoutAncestors = list.filter(([id]) => !ancestors.has(id));
+    if (withoutAncestors.length) list = withoutAncestors;
+
+    list.sort(
+      ([, a], [, b]) =>
+        b.level - a.level ||
+        Number(a.claim) - Number(b.claim) ||
+        a.area - b.area,
+    );
+    return list.map(([, v]) => v.h);
   }
-  return null;
+  return [];
 }
+
+const topmost = (point: maplibregl.PointLike): Hit | null =>
+  hitsAt(point)[0] ?? null;
 
 function toPicked(p: Record<string, any>): Picked {
   return {
@@ -449,10 +567,15 @@ const onKeyDown = (e: KeyboardEvent) => {
   if (e.key === "Escape" && focus.trail.length) drillOut(focus.trail.length - 1);
 };
 
-function bindClick(onPick: (p: Picked | null) => void) {
+function bindClick(onPick: (p: Picked | null, others: Picked[]) => void) {
   map.on("click", (e) => {
-    const hit = topmost(e.point);
-    onPick(hit?.f.properties ? toPicked(hit.f.properties) : null);
+    // The whole stack, not only the winner. Where two polities genuinely
+    // overlap — a de-facto occupier and the de-jure claimant it displaced —
+    // the loser was previously unreachable by any click at all.
+    const stack = hitsAt(e.point)
+      .filter((h) => h.f.properties)
+      .map((h) => toPicked(h.f.properties!));
+    onPick(stack[0] ?? null, stack.slice(1));
   });
 
   map.on("dblclick", (e) => {
@@ -499,68 +622,133 @@ export async function whenIdle(timeoutMs = 12000): Promise<void> {
 }
 
 /**
+ * Frame a polity's global bounds.
+ *
+ * The wrap fix is load-bearing. The Soviet Union's Overpass box runs minlon 20.9
+ * to maxlon -169.0 across the antimeridian; handing that to fitBounds as-is is
+ * an inverted extent, so the camera flew off to nowhere, NOTHING rendered, and
+ * the drill-down then resolved zero children — it looked like a hierarchy bug.
+ */
+function fitTo(b: Bounds | undefined | false) {
+  if (!b) return;
+  const maxlon = b.maxlon < b.minlon ? b.maxlon + 360 : b.maxlon;
+  const { width, height } = map.getCanvas().getBoundingClientRect();
+  const cam = map.cameraForBounds([b.minlon, b.minlat, maxlon, b.maxlat], {
+    // Fixed padding eats a short window alive: 60px each side of a 275px canvas
+    // leaves 155px to fit a country into.
+    padding: Math.min(60, Math.min(width, height) / 8),
+  });
+  if (!cam) return;
+  // Never fit BELOW the source's minzoom. Framing a large country in a short
+  // window landed at z3 against zoom-5-gated tiles: nothing loaded, so the
+  // drill-down resolved no children and looked broken for reasons that had
+  // nothing to do with the hierarchy.
+  map.easeTo({
+    ...cam,
+    zoom: Math.max(cam.zoom ?? 0, ohmMinZoom()),
+    duration: 700,
+  });
+}
+
+/**
  * Focus a polity and reveal the level below it.
  *
  * Bounds come from Overpass, which returns them alongside the wikidata tag we
  * already ask for — the tiles only carry clipped geometry, so a feature's true
  * extent is not otherwise knowable.
  */
-export async function drillInto(p: Picked) {
-  // Idempotent: a double-click can deliver two events, and the SideSheet button
-  // hits the same path, so re-focusing the current polity must not stack a
-  // second identical crumb on the trail.
+export async function drillInto(p: Picked): Promise<boolean> {
+  // Idempotent for the double-click that delivers two events, but NOT a blanket
+  // "same id" bail: the side sheet's button hits this same path, and refusing it
+  // whenever the polity was already the tip is why that button looked dead after
+  // a double-click on the same country.
   const tip = focus.trail[focus.trail.length - 1];
-  if (tip?.osmId === p.osmId) return;
+  const alreadyResolved = tip?.osmId === p.osmId && focus.allow !== null;
+  if (alreadyResolved) return focus.allow!.length > 0;
+
   const level = p.adminLevel ?? 2;
-  await fetchTags([p.osmId]);
-  const b = cachedBounds(p.osmId);
-  if (b) {
-    map.fitBounds([b.minlon, b.minlat, b.maxlon, b.maxlat], {
-      padding: 60,
-      duration: 700,
-    });
+  // A Historical-Basemaps feature has a non-numeric osm_id, so this is a no-op
+  // for it and cachedBounds stays empty — handled below rather than bailing.
+  if (Number.isFinite(p.osmId)) await fetchTags([p.osmId]);
+  fitTo(cachedBounds(p.osmId));
+
+  if (tip?.osmId !== p.osmId) {
+    focus = {
+      trail: [...focus.trail, { osmId: p.osmId, name: p.name, adminLevel: level }],
+      // Provisional, and paired with an EMPTY allow-list, never null: opening
+      // maxLevel with no restriction is what put every province on Earth on
+      // screen and let you select regions outside the parent.
+      maxLevel: level + 2,
+      allow: [],
+    };
+    applyFilters();
+    notify();
   }
 
-  focus = {
-    trail: [...focus.trail, { osmId: p.osmId, name: p.name, adminLevel: level }],
-    // Provisional: opened one notch so children can be found, then narrowed to
-    // the level that actually exists here once tiles for the new view land.
-    maxLevel: level + 2,
-    allow: null,
-  };
-  applyFilters();
-  notify();
-
-  if (!b) return;
-  await whenIdle();
-  const src = pickable()[0];
-  if (!src) return;
-  const { ids, counts } = childIds(map, src.pickLayer, p.osmId, level);
-  focus = {
-    ...focus,
-    maxLevel: nextLevel(level, counts),
-    allow: ids.length ? ids : null,
-  };
-  applyFilters();
-  queueLabels();
-  notify();
+  // No bounds is not a reason to give up — resolve children from the current
+  // view instead. It is the only path a source without Overpass ids ever gets.
+  return resolveChildren(p.osmId, level);
 }
 
 /** Pop back to `index` in the trail; -1 returns to the country view. */
 export function drillOut(index: number) {
   const trail = focus.trail.slice(0, Math.max(0, index));
-  const level = trail.length ? trail[trail.length - 1].adminLevel : 2;
-  focus = { trail, maxLevel: trail.length ? level + 2 : 2, allow: null };
+  const last = trail[trail.length - 1];
+  focus = {
+    trail,
+    maxLevel: last ? last.adminLevel + 2 : 2,
+    // Same rule as drillInto: an open maxLevel always carries a restriction.
+    allow: last ? [] : null,
+  };
   applyFilters();
   queueLabels();
   notify();
-  const last = trail[trail.length - 1];
-  const b = last && cachedBounds(last.osmId);
-  if (b)
-    map.fitBounds([b.minlon, b.minlat, b.maxlon, b.maxlat], {
-      padding: 60,
-      duration: 700,
-    });
+
+  fitTo(last && cachedBounds(last.osmId));
+  // Re-resolve this level's children; the refreshOverlaps pass only widens an
+  // existing list, and popping back starts from an empty one.
+  if (last) void resolveChildren(last.osmId, last.adminLevel);
+}
+
+/**
+ * Wait for the new view, then narrow the focus to the subdivisions that are
+ * genuinely inside the parent. Returns whether any were found — the side sheet
+ * uses that to disable its button instead of appearing to do nothing.
+ */
+async function resolveChildren(osmId: number, level: number): Promise<boolean> {
+  await whenIdle();
+  const r = childrenOf(osmId, level);
+  if (!r) return false;
+  focus = { ...focus, maxLevel: r.level, allow: r.ids };
+  applyFilters();
+  queueLabels();
+  notify();
+  return r.ids.length > 0;
+}
+
+/**
+ * Subdivisions of `osmId` among the currently LOADED TILES.
+ *
+ * Reads the source, not the rendered layers. The focus filter is what hides
+ * subdivisions, so asking the rendered set which subdivisions exist could only
+ * ever answer "none" — the drill resolved an empty list every time and looked
+ * like it did nothing. Source features skip layer filters, so the date filter is
+ * handed to querySourceFeatures directly.
+ */
+function childrenOf(
+  osmId: number,
+  level: number,
+): { ids: number[]; level: number } | null {
+  const s = pickable()[0];
+  if (!s) return null;
+  const [srcId, sourceLayer] = SRC_OF[s.pickLayer] ?? [];
+  if (!srcId || !map.getSource(srcId)) return null;
+  const feats = map.querySourceFeatures(srcId, {
+    sourceLayer,
+    filter: dateFilter(currentDate),
+  });
+  const { ids, counts } = childIds(feats, osmId, level);
+  return { ids, level: nextLevel(level, counts) };
 }
 
 // ---------------------------------------------------------------------------
@@ -575,10 +763,88 @@ function queueLabels() {
   clearTimeout(labelTimer);
   labelsPending++;
   labelTimer = setTimeout(() => {
+    void refreshOverlaps();
     rebuildLabels();
     labelsPending = 0;
     void loadFlags();
   }, 250);
+}
+
+/**
+ * Which polities on screen are de-jure claims.
+ *
+ * The grid is hit-tested rather than reasoned about geometrically because tiles
+ * clip polygons to the viewport: at zoom 6 both the Reich and the Soviet Union
+ * are cut down to roughly the screen rectangle, so every geometric test agrees
+ * they contain each other. A rendered hit test is immune to that.
+ *
+ * Sizes come from Overpass bounding boxes, fetched only for ids that actually
+ * share a point with a same-level neighbour — normally zero, a handful during a
+ * partition — and cached by src/ohm.ts, so most passes make no request at all.
+ */
+async function computeClaims(layers: string[]): Promise<unknown[]> {
+  const { width: w, height: h } = map.getCanvas().getBoundingClientRect();
+  const samples: Sample[] = [];
+  for (let i = 0; i < 6; i++) {
+    for (let j = 0; j < 4; j++) {
+      const pt: [number, number] = [
+        w * (0.1 + (0.8 * i) / 5),
+        h * (0.1 + (0.8 * j) / 3),
+      ];
+      const seen = new Map<string, { id: unknown; level: number }>();
+      for (const f of map.queryRenderedFeatures(pt, { layers })) {
+        const id = f.properties?.osm_id;
+        if (id === undefined || id === null) continue;
+        seen.set(String(id), { id, level: Number(f.properties?.admin_level) || 0 });
+      }
+      if (seen.size > 1) samples.push([...seen.values()]);
+    }
+  }
+  if (!samples.length) return [];
+
+  const ids = overlappingIds(samples).filter((v) => Number.isFinite(Number(v)));
+  await fetchTags(ids.map(Number));
+  const areaOf = (id: unknown) => bboxArea(cachedBounds(Number(id)));
+  return claimsFrom(samples, areaOf);
+}
+
+/**
+ * Recompute the two things that depend on what is currently on screen: which
+ * features are de-jure claims, and which subdivisions belong to the focused
+ * polity.
+ *
+ * Both piggyback on the existing debounced pass rather than adding listeners.
+ * The allow-list is UNIONED because queryRenderedFeatures only sees the
+ * viewport: drilling into a country too big to fit resolved a partial set, and
+ * panning to the rest of it used to show nothing at all.
+ */
+async function refreshOverlaps() {
+  const s = pickable()[0];
+  if (!s || !map.getLayer(s.pickLayer)) return;
+
+  const next = await computeClaims(
+    [s.pickLayer, s.claimLayer].filter((l): l is string => !!l && !!map.getLayer(l)),
+  );
+  const changed =
+    next.length !== claims.length ||
+    next.some((v, i) => String(v) !== String(claims[i]));
+  if (changed) claims = next;
+
+  // Panning loads new tiles, so a country too big to fit on screen keeps
+  // resolving the rest of its subdivisions instead of being stuck with whatever
+  // happened to be loaded at drill time.
+  let widened = false;
+  const tip = focus.trail[focus.trail.length - 1];
+  if (tip && focus.allow) {
+    const r = childrenOf(tip.osmId, tip.adminLevel);
+    const merged = r ? mergeAllow(focus.allow, r.ids) : focus.allow;
+    const level = Math.max(focus.maxLevel, r?.level ?? 0);
+    if (merged.length !== focus.allow.length || level !== focus.maxLevel) {
+      focus = { ...focus, allow: merged, maxLevel: level };
+      widened = true;
+    }
+  }
+  if (changed || widened) applyFilters();
 }
 
 /** True when nothing is queued — the video renderer waits on this. */
@@ -595,7 +861,14 @@ function rebuildLabels() {
     s && s.labelLayer && map.getLayer(s.labelLayer) ? s.labelLayer : s?.pickLayer;
   if (!layer) return src.setData({ type: "FeatureCollection", features: [] });
 
-  src.setData(buildLabelPoints(map.queryRenderedFeatures({ layers: [layer] })) as never);
+  // The claim layer too, or a hatched polity loses its name — the one case
+  // where you most need to be told which two countries are involved.
+  const layers = [layer, s?.claimLayer].filter(
+    (l): l is string => !!l && !!map.getLayer(l) && l !== layer,
+  );
+  src.setData(
+    buildLabelPoints(map.queryRenderedFeatures({ layers: [layer, ...layers] })) as never,
+  );
 }
 
 // ponytail: 30 flags per pass, national boundaries only. Beyond that you get

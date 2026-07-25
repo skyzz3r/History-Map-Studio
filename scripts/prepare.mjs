@@ -44,7 +44,16 @@ const KEEP = new Set([
   "disputed",
   "disputed_by",
   "maritime",
+  // Occupation / de-facto control. Drives the ohm-occupation layer's colouring.
+  "occupant",
+  "controlled_by",
+  "claimed_by",
+  "military",
+  "border_type",
 ]);
+
+/** Everything the extract pulls in that is NOT an administrative boundary. */
+const OVERLAY = new Set(["political", "military"]);
 
 const CUMULATIVE = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
 const isLeap = (y) => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
@@ -83,6 +92,20 @@ export function transform(f) {
   props.start_num = toDecimalYear(p.start_date) ?? NO_START;
   props.end_num = toDecimalYear(p.end_date) ?? NO_END;
   props.admin_level = Number(props.admin_level) || 0;
+
+  // Occupation zones, DMZs and political districts carry no admin_level, and 0
+  // reads as "shallower than a country" to the hierarchy filter — which would
+  // pin them on screen at every focus level. Stamp them as country-level and
+  // flag them so the overlay layer can select them with a numeric compare.
+  if (
+    OVERLAY.has(p.boundary) ||
+    p.military === "occupation_zone" ||
+    p.border_type === "demilitarized_zone"
+  ) {
+    props.overlay = 1;
+    if (!props.admin_level) props.admin_level = 2;
+  }
+
   // osmium writes the id as "r1234"/"w1234"; match the negative-for-relation
   // convention the hosted tiles use so src/ohm.ts needs no second code path.
   const id = String(f.id ?? p["@id"] ?? "");

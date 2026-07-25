@@ -1,15 +1,26 @@
+import { useEffect, useState } from "react";
 import { drillInto, type Picked } from "../map.ts";
 import type { Info } from "../wikidata.ts";
 
 export default function SideSheet({
   picked,
   info,
+  others,
+  onSelect,
   onClose,
 }: {
   picked: Picked;
   info: Info | null;
+  /** Other polities under the same click — an occupier and the claim it displaced. */
+  others: Picked[];
+  onSelect: (p: Picked) => void;
   onClose: () => void;
 }) {
+  // "none" only after a drill actually ran and came back empty, so the button
+  // never lies about data it has not looked for yet.
+  const [sub, setSub] = useState<"idle" | "busy" | "none">("idle");
+  useEffect(() => setSub("idle"), [picked]);
+
   return (
     <aside className="absolute right-0 top-0 flex h-full w-80 flex-col gap-4 overflow-y-auto border-l border-neutral-800 bg-neutral-900/95 p-5 backdrop-blur">
       <div className="flex items-start justify-between gap-2">
@@ -58,11 +69,39 @@ export default function SideSheet({
       </dl>
 
       <button
-        onClick={() => void drillInto(picked)}
-        className="rounded-lg bg-neutral-800 px-3 py-1.5 text-left text-sm text-neutral-200 hover:bg-neutral-700"
+        disabled={sub !== "idle"}
+        onClick={async () => {
+          setSub("busy");
+          setSub((await drillInto(picked)) ? "idle" : "none");
+        }}
+        className="rounded-lg bg-neutral-800 px-3 py-1.5 text-left text-sm text-neutral-200 hover:bg-neutral-700 disabled:cursor-default disabled:opacity-50 disabled:hover:bg-neutral-800"
       >
-        Show subdivisions ↓
+        {sub === "busy"
+          ? "Looking…"
+          : sub === "none"
+            ? "No subdivisions recorded"
+            : "Show subdivisions ↓"}
       </button>
+
+      {/* Two polities can genuinely cover one point — in 1942 the Deutsches
+          Reich held Lviv while the Soviet Union still claimed it. Without this
+          list the one that loses the click is unreachable by any click. */}
+      {others.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-xs uppercase tracking-wide text-neutral-500">
+            Also here
+          </p>
+          {others.map((o) => (
+            <button
+              key={o.osmId}
+              onClick={() => onSelect(o)}
+              className="block w-full rounded px-2 py-1 text-left text-sm text-neutral-300 hover:bg-neutral-800"
+            >
+              {o.name}
+            </button>
+          ))}
+        </div>
+      )}
 
       {info?.summary && (
         <p className="text-sm leading-relaxed text-neutral-300">{info.summary}</p>

@@ -6,9 +6,16 @@ import { lerpBearing, sampleCamera, type Key } from "./keyframes.ts";
 import { activeAt, wdYear } from "./wikidata.ts";
 import { enTitleOf, parseBounds, parseOverpass, qidOf } from "./ohm.ts";
 import { toDecimalYear, toInputDate } from "./dates.ts";
-import { inside, labelPoint, pointOnSurface } from "./geo.ts";
+import {
+  featureArea,
+  inside,
+  insideGeometry,
+  labelPoint,
+  pointOnSurface,
+} from "./geo.ts";
 import { buildLabelPoints } from "./labels.ts";
-import { focusFilter, inBounds, nextLevel } from "./focus.ts";
+import { bboxArea, claimsFrom, overlappingIds, type Sample } from "./claims.ts";
+import { childIds, focusFilter, inBounds, mergeAllow, nextLevel } from "./focus.ts";
 import { normaliseCShapes, normaliseHB } from "./sources.ts";
 
 // --- lerpBearing: must take the short way round ---
@@ -232,6 +239,49 @@ const prussia = [
 assert.ok(!inside(holbaek, prussia), "point-in-polygon correctly excludes it");
 assert.ok(inside([13, 52.5], prussia), "Berlin is still inside");
 
+// The same case end to end. Brandenburg is inside Prussia, Holbæk is not, and a
+// second Prussian piece (tiles clip the parent) must not double-count a tier.
+const child = (id: number, al: number, r: number[][]) => ({
+  properties: { osm_id: id, admin_level: al },
+  geometry: { type: "Polygon", coordinates: [r] },
+});
+const kids = childIds(
+  [
+    { properties: { osm_id: -100, admin_level: 2 },
+      geometry: { type: "Polygon", coordinates: [prussia] } },
+    child(-201, 4, box(12, 52, 14, 53)), // Brandenburg
+    child(-202, 4, box(8, 50, 10, 52)), // Westfalen
+    child(-202, 4, box(10, 50, 11, 51)), // a clipped second piece of the same
+    child(-300, 4, box(11.5, 55.5, 12, 55.9)), // Holbæk, inside the BBOX only
+  ],
+  -100,
+  2,
+);
+assert.deepEqual(kids.ids.sort(), [-202, -201].sort(), "no Danish amts");
+assert.equal(kids.counts.get(4), 2, "a clipped province must not vote twice");
+assert.equal(nextLevel(2, kids.counts), 4);
+// The parent must be found: with no parent geometry there are no children.
+assert.deepEqual(childIds([child(-201, 4, box(12, 52, 14, 53))], -100, 2).ids, []);
+
+// A two-lobed child OUTSIDE the parent must stay out. Averaging its vertices
+// lands between the lobes — inside Prussia — which is exactly how Austrian
+// Silesia ended up listed as a Prussian province.
+const austrianSilesia = {
+  properties: { osm_id: -400, admin_level: 4 },
+  geometry: {
+    type: "MultiPolygon",
+    coordinates: [[box(17, 49.5, 18.5, 50)], [box(18.5, 49.5, 19.5, 50)]],
+  },
+};
+const wideParent = {
+  properties: { osm_id: -100, admin_level: 2 },
+  geometry: { type: "Polygon", coordinates: [box(5, 50.5, 22, 55)] },
+};
+assert.ok(
+  !childIds([wideParent, austrianSilesia], -100, 2).ids.includes(-400),
+  "a child entirely south of the parent is never its subdivision",
+);
+
 // --- overpass bounds: same call as the tags, same negative-id convention ---
 const withBb = {
   elements: [
@@ -292,5 +342,79 @@ const hbLabels = buildLabelPoints([
     geometry: { type: "Polygon", coordinates: [box(10, 40, 16, 46)] } },
 ] as any);
 assert.equal(hbLabels.features.length, 2, "string ids dedupe too");
+
+// --- allow: [] and allow: null are NOT the same filter ---
+// Getting this wrong put every province on Earth on screen: an opened maxLevel
+// with no restriction. `[]` means "resolved, nothing qualifies".
+const openNull = JSON.stringify(focusFilter({ trail: [], maxLevel: 4, allow: null }));
+const openEmpty = JSON.stringify(focusFilter({ trail: [], maxLevel: 4, allow: [] }));
+assert.notEqual(openNull, openEmpty, "empty allow must restrict, null must not");
+assert.ok(openEmpty.includes('"literal"'), "empty allow still emits an id test");
+
+// --- claim detection ---
+// The real Lviv 1942 case: Deutsches Reich (-2692712) and Soviet Union
+// (-2851156) hit-test at the same point, same admin_level. The bigger polity is
+// the surviving de-jure claim, so it hatches and the occupier stays solid.
+const REICH = -2692712;
+const USSR = -2851156;
+const sizeOf = (id: unknown) => (id === USSR ? 6000 : id === REICH ? 400 : 0);
+const lviv: Sample[] = [
+  [
+    { id: USSR, level: 2 },
+    { id: REICH, level: 2 },
+  ],
+];
+assert.deepEqual(claimsFrom(lviv, sizeOf), [USSR], "the bigger one is the claim");
+
+// The USSR's real bounding box wraps the antimeridian (minlon 20.9, maxlon
+// -169.0). A plain subtraction scores it -8882 against the Reich's 208, which
+// made the occupier the "bigger" one and hatched exactly the wrong country.
+const realUSSR = { minlon: 20.8851163, maxlon: -168.9769333, minlat: 35.129093, maxlat: 81.90836 };
+const realReich = { minlon: 5.7356987, maxlon: 26.4435113, minlat: 45.837241, maxlat: 55.8975803 };
+assert.ok(bboxArea(realUSSR) > 0, "a wrapped box has positive area");
+assert.ok(bboxArea(realUSSR) > bboxArea(realReich), "the USSR is the bigger polity");
+assert.equal(bboxArea(undefined), 0, "unknown size never wins a comparison");
+assert.deepEqual(overlappingIds(lviv).sort(), [USSR, REICH].sort());
+
+// A point with one feature is not an overlap, however many points there are.
+assert.deepEqual(claimsFrom([[{ id: 1, level: 2 }]], sizeOf), []);
+assert.deepEqual(overlappingIds([[{ id: 1, level: 2 }]]), []);
+
+// Different levels never pair: a province inside its country is just hierarchy.
+assert.deepEqual(
+  claimsFrom([[{ id: 1, level: 2 }, { id: 2, level: 4 }]], sizeOf),
+  [],
+  "a province does not make its country a claim",
+);
+
+// An unmeasured polity scores 0 and therefore stays SOLID — never hatch on a
+// guess when Overpass has not answered yet.
+assert.deepEqual(
+  claimsFrom([[{ id: 7, level: 2 }, { id: 8, level: 2 }]], () => 0),
+  [8],
+  "ties keep the first as de-facto, only one is hatched",
+);
+
+// --- insideGeometry honours holes ---
+// Not used by claim detection any more (tile clipping defeats geometry there),
+// but enclave-vs-containment still matters wherever anchors are tested.
+const big = box(20, 48, 32, 58);
+const small = box(23, 49, 26, 52);
+const poly = (r: number[][], holes: number[][][] = []) => ({
+  type: "Polygon" as const,
+  coordinates: [r, ...holes],
+});
+assert.equal(insideGeometry([24.5, 50], poly(big)), true);
+assert.equal(insideGeometry([24.5, 50], poly(big, [small])), false, "in the hole");
+assert.equal(insideGeometry([21, 49], poly(big, [small])), true, "outside the hole");
+
+// --- featureArea: the property topmost() used to read does not exist ---
+assert.ok(featureArea(poly(big)) > featureArea(poly(small)), "real area, not props");
+assert.equal(featureArea({ type: "Point", coordinates: [0, 0] }), 0);
+
+// --- mergeAllow: panning widens, never resets ---
+assert.deepEqual(mergeAllow([1, 2], [2, 3]).sort(), [1, 2, 3]);
+assert.deepEqual(mergeAllow(null, [4, 4]), [4]);
+assert.deepEqual(mergeAllow([1], []), [1], "an empty pass must not clear the list");
 
 console.log("ok");

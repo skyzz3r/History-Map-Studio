@@ -10,8 +10,7 @@
 // ids ONCE per drill-down (using bounds Overpass already returns alongside the
 // wikidata tag) and filter to that explicit id list.
 
-import type { Map as MLMap } from "maplibre-gl";
-import { inside, outerRings, type Ring } from "./geo.ts";
+import { inside, labelPoint, outerRings, type Ring } from "./geo.ts";
 
 export type Level = { osmId: number; name: string; adminLevel: number };
 
@@ -54,10 +53,16 @@ export const initialFocus = (): FocusState => ({
  * The layer filter for the current focus, combined with the date filter by the
  * caller. `allow` is an explicit id list rather than a geometric test because
  * MapLibre style expressions cannot ask "is this inside that polygon".
+ *
+ * `allow: []` and `allow: null` are NOT the same thing and the difference was a
+ * real bug. `[]` means "children resolved, none of them qualify" and hides every
+ * subdivision; `null` means "no restriction" and, paired with an opened
+ * maxLevel, put every province on Earth on screen and under the cursor. Callers
+ * must never substitute null for an empty result.
  */
 export function focusFilter(f: FocusState): any {
   const base: any = ["<=", ["coalesce", ["get", "admin_level"], 99], f.maxLevel];
-  if (!f.allow) return base;
+  if (f.allow === null || f.allow === undefined) return base;
   return [
     "all",
     base,
@@ -70,6 +75,17 @@ export function focusFilter(f: FocusState): any {
   ];
 }
 
+/**
+ * Union of the allow-list with newly-resolved ids.
+ *
+ * childIds only sees the VIEWPORT, so drilling into a country that does not fit
+ * on screen resolved a partial set and panning east showed nothing — the rest of
+ * its provinces were excluded forever. Merging each pass fixes that without ever
+ * widening past the parent, since every pass still tests containment.
+ */
+export const mergeAllow = (prev: number[] | null, found: number[]): number[] =>
+  prev ? [...new Set([...prev, ...found])] : [...new Set(found)];
+
 export type Bounds = {
   minlat: number;
   minlon: number;
@@ -77,21 +93,17 @@ export type Bounds = {
   maxlon: number;
 };
 
-/** Centre of a rendered feature, used to test containment against the parent. */
-function centreOf(geom: any): [number, number] | null {
-  let n = 0;
-  let x = 0;
-  let y = 0;
-  const walk = (c: any) => {
-    if (typeof c?.[0] === "number") {
-      x += c[0];
-      y += c[1];
-      n++;
-    } else if (Array.isArray(c)) c.forEach(walk);
-  };
-  walk(geom?.coordinates);
-  return n ? [x / n, y / n] : null;
-}
+/**
+ * The point used to test a child against its supposed parent.
+ *
+ * labelPoint, not an average of the coordinates. Averaging is what put
+ * `Rakouské Slezsko` — an AUSTRIAN crownland — in the Kingdom of Prussia's
+ * subdivisions: it has two lobes, and the mean of their vertices lands north of
+ * both, inside Prussian Silesia. labelPoint returns a pole of inaccessibility on
+ * the largest ring, which is guaranteed to be inside the child itself.
+ */
+const centreOf = (geom: any): [number, number] | null =>
+  labelPoint(geom)?.at ?? null;
 
 export const inBounds = (pt: [number, number], b: Bounds) =>
   pt[0] >= b.minlon && pt[0] <= b.maxlon && pt[1] >= b.minlat && pt[1] <= b.maxlat;
@@ -106,16 +118,20 @@ export const inBounds = (pt: [number, number], b: Bounds) =>
  *
  * The parent arrives as several tile-clipped pieces, so test against the union:
  * a child counts if its centre falls inside ANY piece.
+ *
+ * `feats` must come from querySourceFeatures, NOT queryRenderedFeatures. The
+ * rendered set is already narrowed by the focus filter, so at maxLevel 2 the
+ * subdivisions we are trying to discover are exactly the features that have been
+ * filtered out — discovery could never succeed and the drill silently found
+ * nothing. Source features ignore layer filters, so the date filter has to be
+ * passed to querySourceFeatures by the caller instead.
  */
 export function childIds(
-  map: MLMap,
-  layer: string,
+  feats: { properties?: any; geometry?: any }[],
   parentId: number,
   level: number,
 ): { ids: number[]; counts: Map<number, number> } {
   const none = { ids: [], counts: new Map<number, number>() };
-  if (!map.getLayer(layer)) return none;
-  const feats = map.queryRenderedFeatures({ layers: [layer] });
 
   const parent: Ring[] = [];
   for (const f of feats)

@@ -17,6 +17,8 @@ export default function App() {
   const [count, setCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<Picked | null>(null);
+  // Everything else under the same click, so an overlapped polity stays reachable.
+  const [others, setOthers] = useState<Picked[]>([]);
   const [info, setInfo] = useState<Info | null>(null);
   const [studio, setStudio] = useState(false);
   const [keys, setKeys] = useState<Key[]>([]);
@@ -30,7 +32,10 @@ export default function App() {
         if (cancelled) return;
         setCount(snaps.length);
         bindFocusChange(setFocus);
-        await initMap(container.current!, setPicked);
+        await initMap(container.current!, (p, rest) => {
+          setPicked(p);
+          setOthers(rest);
+        });
         if (cancelled) return;
         setFocus(getFocus());
         applyIndex(snaps.length - 1, true); // open on the present day
@@ -108,7 +113,18 @@ export default function App() {
       <Timeline max={count - 1} />
 
       {picked && (
-        <SideSheet picked={picked} info={info} onClose={() => setPicked(null)} />
+        <SideSheet
+          picked={picked}
+          info={info}
+          others={others}
+          // Swapping to an overlapped polity keeps the rest of the stack
+          // available, with the one you just left put back in it.
+          onSelect={(p) => {
+            setOthers([picked, ...others.filter((o) => o.osmId !== p.osmId)]);
+            setPicked(p);
+          }}
+          onClose={() => setPicked(null)}
+        />
       )}
     </div>
   );

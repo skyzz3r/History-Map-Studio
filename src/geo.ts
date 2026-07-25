@@ -82,6 +82,39 @@ export function outerRings(g: any): Ring[] {
   return [];
 }
 
+/** Polygons as [outer, ...holes] lists; [] for anything that is not areal. */
+export function polygons(g: any): Ring[][] {
+  if (!g) return [];
+  if (g.type === "Polygon") return [g.coordinates];
+  if (g.type === "MultiPolygon") return g.coordinates;
+  return [];
+}
+
+/**
+ * Point-in-geometry that RESPECTS HOLES.
+ *
+ * `inside(pt, outerRing)` is not enough here, and getting that wrong is not
+ * cosmetic: San Marino's anchor sits inside Italy's outer ring, so an
+ * outer-ring-only test reads every enclave as "one country covering another"
+ * and would hatch Italy. OHM cuts a hole for the enclave, so honouring holes
+ * separates a genuine enclave from a genuine overlapping claim.
+ */
+export function insideGeometry(pt: number[], g: any): boolean {
+  for (const rings of polygons(g)) {
+    if (!rings.length || !inside(pt, rings[0])) continue;
+    if (rings.slice(1).some((h) => inside(pt, h))) continue; // in a hole
+    return true;
+  }
+  return false;
+}
+
+/** Total |area| of a feature's outer rings. Used to rank nested picks. */
+export function featureArea(g: any): number {
+  let a = 0;
+  for (const r of outerRings(g)) if (r?.length >= 4) a += Math.abs(ringArea(r));
+  return a;
+}
+
 /**
  * One anchor per FEATURE, on its largest ring — not one per part.
  *

@@ -46,13 +46,24 @@ fi
 # NOT `historic=yes`: that tag is on exactly ONE administrative boundary in all
 # of OHM (checked via Overpass). Everything in OHM is historic by definition.
 #
+# `wr/` and not `w/`: administrative boundaries in OHM are RELATIONS. A ways-only
+# filter drops nearly all of them.
+#
+# The non-administrative classes are cheap and nearly empty today — measured via
+# Overpass: boundary=military 3, boundary=political 14, military=occupation_zone
+# 0, border_type=demilitarized_zone 0. They are in the extract so the occupation
+# overlay has somewhere to draw from when OHM tagging catches up.
+#
 # The pipe matters. Writing filtered.osm.pbf and then a planet-wide GeoJSON
 # needed ~30 GB of scratch; osmium streams one stage into the next, so only the
 # boundary subset ever touches disk. tippecanoe cannot read .osm.pbf, so the
 # export stage is required either way.
 if [ ! -f "$WORK/prepared.geojsonseq" ]; then
   echo "==> filter + export + prepare (streamed)"
-  osmium tags-filter -o - -f pbf "$WORK/planet.osm.pbf" wr/boundary=administrative \
+  osmium tags-filter -o - -f pbf "$WORK/planet.osm.pbf" \
+    wr/boundary=administrative,political,military \
+    wr/military=occupation_zone \
+    wr/border_type=demilitarized_zone \
     | osmium export -f geojsonseq --attributes=id,type - \
     | node --experimental-strip-types scripts/prepare.mjs \
     > "$WORK/prepared.geojsonseq"
