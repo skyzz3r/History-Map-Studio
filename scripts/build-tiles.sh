@@ -139,10 +139,22 @@ fi
 #   -P   parallel input (the RS-separated stream allows it)
 #   -Z0  keep tiles all the way out to the world view: this is the zoom gate
 #        being removed, and label points carry minzoom 0 from prepare.mjs
+#
+# The ladder starts at 10, not 12. z12 was aspirational and never once
+# completed: run #3 spent two and a half hours in "Reordering geometry" and
+# reached 3%. Administrative borders do not carry z12 detail worth the cost,
+# and the point of this whole exercise is removing a zoom-5 floor — z10 clears
+# that by five levels. MapLibre overzooms past the maximum, so the borders stay
+# on screen above it, just not more finely drawn.
+#
+# `-l boundaries` names the DEFAULT layer. Per-feature "tippecanoe":{"layer":...}
+# directives from prepare.mjs still win, but run #3 logged `using name
+# "preparedgeojsonseq"` — so without this, anything missing a directive lands in
+# a layer named after the input file, which no style references.
 FINAL_Z=""
-for Z in 12 10 8; do
+for Z in 10 8 6; do
   say "tippecanoe -z$Z"
-  tippecanoe -o "$OUT" --force -P -Z0 -z"$Z" \
+  tippecanoe -o "$OUT" --force -P -Z0 -z"$Z" -l boundaries \
     --drop-densest-as-needed --no-tile-size-limit \
     "$WORK/prepared.geojsonseq"
   SIZE=$(du -m "$OUT" | cut -f1)
@@ -153,10 +165,10 @@ done
 
 if [ -z "$FINAL_Z" ]; then
   cat <<WARN
-!! Could not fit under ${LIMIT_MB} MB even at z8.
+!! Could not fit under ${LIMIT_MB} MB even at z6.
 !! GitHub Pages will reject this file. Options: host it on Cloudflare R2 (free
 !! tier, CORS configurable) and point OHM_TILES at that, or narrow the extract
-!! (e.g. admin_level<=4). Leaving the z8 build in place for inspection.
+!! (e.g. admin_level<=4). Leaving the z6 build in place for inspection.
 WARN
   exit 1
 fi
@@ -166,7 +178,7 @@ echo "  $OUT"
 echo "  $(du -m "$OUT" | cut -f1) MB, zoom 0-${FINAL_Z}"
 # if/then, not `&&`: at z12 the test is false, and under `set -e` that would
 # fail the job on the last line after a completely successful build.
-if [ "$FINAL_Z" -lt 12 ]; then
+if [ "$FINAL_Z" -lt 10 ]; then
   echo "  NOTE: capped at z$FINAL_Z to fit; detail above that zoom is lost."
 fi
 echo "===================================================="

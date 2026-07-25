@@ -157,7 +157,13 @@ const ohm: Source = {
       type: "vector",
       ...t.spec,
       minzoom: t.minzoom,
-      maxzoom: 12,
+      // Only for the HOSTED tiles, which really are z5-12. Our own archive
+      // reports its own range, and the build steps that range DOWN when the
+      // output will not fit under the Pages 100 MB cap — hardcoding 12 over the
+      // top of it would ask for tiles the file does not contain, and the
+      // borders would simply vanish above the real maximum instead of
+      // overzooming the last level it has.
+      ...(t.local ? {} : { maxzoom: 12 }),
       // These tiles carry no feature ids, so feature-state hover has nothing to
       // key on without this. osm_id is unique per feature (verified 980/980)
       // and stable across tiles, so a country split across two tiles highlights

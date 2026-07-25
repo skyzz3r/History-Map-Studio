@@ -108,9 +108,32 @@ export function osmIdOf(f) {
  * One input feature -> the features to emit. Returns [] for anything without
  * usable geometry so bad input cannot poison a tile.
  */
+/**
+ * Round every coordinate to 6 decimal places, in place.
+ *
+ * ~11 cm at the equator — far finer than any historical border is actually
+ * known, and finer than tippecanoe's own tile grid resolves at z12.
+ *
+ * This is the single biggest lever on build time. osmium writes full float
+ * precision, so a vertex is "-73.98765432109876" — 19 bytes where 10 will do.
+ * The unrounded stream was 9023 MB for 203,705 features, and tippecanoe spent
+ * two and a half hours in "Reordering geometry" without finishing. The cost is
+ * driven by bytes, not by feature count.
+ */
+function round6(c) {
+  if (typeof c[0] === "number") {
+    c[0] = Math.round(c[0] * 1e6) / 1e6;
+    c[1] = Math.round(c[1] * 1e6) / 1e6;
+    if (c.length > 2) c.length = 2; // elevation is dead weight in a boundary
+    return;
+  }
+  for (const x of c) round6(x);
+}
+
 export function transform(f) {
   const p = f?.properties;
   if (!p || !f.geometry) return [];
+  if (f.geometry.coordinates) round6(f.geometry.coordinates);
 
   const props = {};
   for (const k of Object.keys(p)) if (KEEP.has(k)) props[k] = p[k];
