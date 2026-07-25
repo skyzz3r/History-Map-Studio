@@ -75,6 +75,33 @@ export function toDecimalYear(iso) {
   return year + (doy - 1) / (isLeap(year) ? 366 : 365);
 }
 
+/**
+ * Feature -> the signed osm_id the app uses, or null.
+ *
+ * The whole app numbers relations NEGATIVE — src/ohm.ts maps that back to an
+ * Overpass `rel(id:...)`, and hover, drill-down bounds and every Wikidata
+ * lookup key on it.
+ *
+ * The sign CANNOT come from an "r" prefix. `osmium export --attributes=id,type`
+ * writes `@id` as a plain positive number and puts the object class in a
+ * separate `@type`, which is `"relation"` for an area assembled from a
+ * multipolygon or boundary relation. Reading a prefix that is never there made
+ * every relation positive, which would have silently broken every one of those
+ * lookups in tiles that otherwise looked perfectly fine.
+ *
+ * The prefixed form is still accepted, since other osmium subcommands emit it.
+ */
+export function osmIdOf(f) {
+  const p = f?.properties ?? {};
+  const raw = String(f?.id ?? p["@id"] ?? p.id ?? "");
+  if (!raw) return null;
+  const num = parseInt(raw.replace(/^[a-z]/i, ""), 10);
+  if (!Number.isFinite(num)) return null;
+  const isRelation =
+    p["@type"] === "relation" || p.type === "relation" || /^r/i.test(raw);
+  return isRelation ? -Math.abs(num) : Math.abs(num);
+}
+
 // --- transform ------------------------------------------------------------
 
 /**
@@ -106,11 +133,8 @@ export function transform(f) {
     if (!props.admin_level) props.admin_level = 2;
   }
 
-  // osmium writes the id as "r1234"/"w1234"; match the negative-for-relation
-  // convention the hosted tiles use so src/ohm.ts needs no second code path.
-  const id = String(f.id ?? p["@id"] ?? "");
-  const num = parseInt(id.replace(/^[a-z]/, ""), 10);
-  if (Number.isFinite(num)) props.osm_id = id.startsWith("r") ? -num : num;
+  const osmId = osmIdOf(f);
+  if (osmId !== null) props.osm_id = osmId;
 
   const out = [
     { type: "Feature", geometry: f.geometry, properties: props,

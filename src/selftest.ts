@@ -17,6 +17,11 @@ import { buildLabelPoints } from "./labels.ts";
 import { bboxArea, claimsFrom, overlappingIds, type Sample } from "./claims.ts";
 import { childIds, focusFilter, inBounds, mergeAllow, nextLevel } from "./focus.ts";
 import { normaliseCShapes, normaliseHB } from "./sources.ts";
+// The tile pipeline is plain .mjs so CI can run it with no bundler; it has no
+// types. Tested here anyway — its id signing is the one thing that can produce
+// tiles that look perfectly healthy and resolve nothing.
+// @ts-expect-error untyped .mjs
+import { osmIdOf } from "../scripts/prepare.mjs";
 
 // --- lerpBearing: must take the short way round ---
 assert.equal(lerpBearing(0, 90, 0.5), 45);
@@ -416,5 +421,26 @@ assert.equal(featureArea({ type: "Point", coordinates: [0, 0] }), 0);
 assert.deepEqual(mergeAllow([1, 2], [2, 3]).sort(), [1, 2, 3]);
 assert.deepEqual(mergeAllow(null, [4, 4]), [4]);
 assert.deepEqual(mergeAllow([1], []), [1], "an empty pass must not clear the list");
+
+// --- the tile pipeline's id signing ---
+// Relations MUST come out negative: src/ohm.ts turns a negative osm_id into an
+// Overpass rel() lookup, and hover, drill-down bounds and every Wikidata card
+// key on it. `osmium export --attributes=id,type` writes @id as a plain
+// POSITIVE number with the class in @type, so a prefix check finds nothing and
+// silently produces tiles that look fine and resolve nothing.
+assert.equal(
+  osmIdOf({ properties: { "@id": 2851156, "@type": "relation" } }),
+  -2851156,
+  "osmium's @type is the only signal that this is a relation",
+);
+assert.equal(osmIdOf({ properties: { "@id": 4242, "@type": "way" } }), 4242);
+// The prefixed form other osmium subcommands emit must still work.
+assert.equal(osmIdOf({ id: "r2851156", properties: {} }), -2851156);
+assert.equal(osmIdOf({ id: "w4242", properties: {} }), 4242);
+// A boundary relation carries the OSM tag type=boundary; that must not be read
+// as the object class and flip a way negative.
+assert.equal(osmIdOf({ properties: { "@id": 7, "@type": "way", type: "boundary" } }), 7);
+assert.equal(osmIdOf({ properties: {} }), null);
+assert.equal(osmIdOf({ properties: { "@id": "junk" } }), null);
 
 console.log("ok");
