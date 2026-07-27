@@ -245,6 +245,12 @@ const ohm: Source = {
         paint: {
           "fill-color": [
             "case",
+            // A region the user assigned to an empire takes the empire's colour,
+            // so a detached colony reads as its territory and not a lone country.
+            // Set as feature-state by map.ts, since a tile filter cannot look up
+            // membership. Above disputed so an assigned member is never mistaken
+            // for a contested border.
+            ["boolean", ["feature-state", "member"], false], "#a78bfa",
             ["has", "disputed_by"], "#d97706",
             // Empires and unions read as one warm shape at the world view.
             ["<=", ["coalesce", ["get", "admin_level"], 9], 1], "#a78bfa",
@@ -266,6 +272,7 @@ const ohm: Source = {
         paint: {
           "line-color": [
             "case",
+            ["boolean", ["feature-state", "member"], false], "#c4b5fd",
             ["has", "disputed_by"], "#f59e0b",
             ["<=", ["coalesce", ["get", "admin_level"], 9], 1], "#c4b5fd",
             ["==", ["get", "admin_level"], COUNTRY_LEVEL], "#f8fafc",

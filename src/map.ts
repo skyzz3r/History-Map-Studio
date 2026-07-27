@@ -37,6 +37,7 @@ import {
   initialFocus,
   mergeAllow,
   nextLevel,
+  ROOT_LEVEL,
   type FocusState,
   type Level,
 } from "./focus.ts";
@@ -223,6 +224,47 @@ function refreshEdits() {
   src?.setData(editFeatures(editSourceId()) as never);
 }
 
+/** Ids currently flagged `member`, so the flag can be cleared when an edit goes. */
+let memberFlags: (string | number)[] = [];
+
+/**
+ * Paint every region assigned to an EMPIRE (a level-1 parent) in the empire's
+ * colour by flagging it `member` — the paint expressions in sources.ts read that
+ * feature-state. A tile filter cannot look up "does this belong to that", so the
+ * membership has to be pushed onto the features here, and re-pushed whenever the
+ * edits change or new tiles arrive (feature-state itself survives tile loads).
+ * Only level-1 parents qualify: assigning a province to a country must not turn
+ * it violet, which is the empire hue.
+ */
+function applyMemberState() {
+  if (!map?.getSource("hist-ohm")) return;
+  const set = (id: string | number, on: boolean) => {
+    map.setFeatureState(
+      { source: "hist-ohm", sourceLayer: "boundaries", id },
+      { member: on },
+    );
+    if (map.getSource("hist-edits"))
+      map.setFeatureState({ source: "hist-edits", id }, { member: on });
+  };
+  for (const id of memberFlags) set(id, false);
+  memberFlags = [];
+
+  const parents = parentOverrides(currentSourceId());
+  if (!parents.size) return;
+  const roots = new Set<string>();
+  for (const f of map.querySourceFeatures("hist-ohm", { sourceLayer: "boundaries" }))
+    if (Number(f.properties?.admin_level) === ROOT_LEVEL)
+      roots.add(String(f.properties?.osm_id));
+
+  for (const [child, parent] of parents) {
+    if (!roots.has(parent)) continue;
+    const n = Number(child);
+    const id = Number.isFinite(n) && child.trim() !== "" ? n : child;
+    set(id, true);
+    memberFlags.push(id);
+  }
+}
+
 /**
  * The overlay every edit is drawn from. Amber, so a corrected or invented
  * border never passes for source data.
@@ -405,6 +447,7 @@ async function addHistoryLayers() {
     // source and layer we own.
     addEditLayers();
     if (clip) ensureClipMask();
+    applyMemberState();
     applyFilters();
     queueLabels();
   } finally {
@@ -1276,6 +1319,9 @@ async function refreshOverlaps() {
   }
 
   if (changed || widened || recovered) applyFilters();
+  // Tiles for an empire (or its detached member) can arrive after the edit was
+  // made, so re-flag membership once the current view has settled.
+  applyMemberState();
 }
 
 /** True when nothing is queued — the video renderer waits on this. */
@@ -1506,6 +1552,7 @@ export async function drawRegion(): Promise<string | null> {
 onEditsChange(() => {
   if (!map) return;
   refreshEdits();
+  applyMemberState();
   applyFilters();
   queueLabels();
 });
