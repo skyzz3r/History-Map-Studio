@@ -746,6 +746,53 @@ function membersOf(parentId: string | number): (string | number)[] {
   return out;
 }
 
+/** osm_ids of the empires/unions in the loaded tiles, so membership can be
+ *  gated on a REAL level-1 parent rather than any assigned id. */
+function rootEmpireIds(): Set<string> {
+  const out = new Set<string>();
+  if (!map?.getSource("hist-ohm")) return out;
+  for (const f of map.querySourceFeatures("hist-ohm", { sourceLayer: "boundaries" }))
+    if (Number(f.properties?.admin_level) === ROOT_LEVEL)
+      out.add(String(f.properties?.osm_id));
+  return out;
+}
+
+/**
+ * The empire a region was assigned to, or null. At the world view a member acts
+ * AS its empire: hovering it animates the whole empire territory, and clicking
+ * it opens the empire. Only a level-1 parent counts — assigning a province to a
+ * country does not make the province stand in for the country.
+ */
+function parentEmpireOf(id: string | number): string | null {
+  const parent = parentOverrides(currentSourceId()).get(String(id));
+  if (parent === undefined) return null;
+  return rootEmpireIds().has(parent) ? parent : null;
+}
+
+const asId = (id: string): string | number => {
+  const n = Number(id);
+  return Number.isFinite(n) && id.trim() !== "" ? n : id;
+};
+
+/** The whole territory to light up for `id`: the empire it belongs to (or is)
+ *  plus every member. Empty when `id` is a plain polity with no empire ties. */
+function highlightGroup(id: string | number): (string | number)[] {
+  const empire = parentEmpireOf(id);
+  if (empire !== null) return [asId(empire), ...membersOf(empire)];
+  const mine = membersOf(id);
+  return mine.length ? [id, ...mine] : [];
+}
+
+/** A Picked for an empire by id, from the loaded tiles. Falls back to a bare
+ *  record so a click still opens something even if the empire is off-tile. */
+function empirePicked(empireId: string): Picked {
+  if (map.getSource("hist-ohm"))
+    for (const f of map.querySourceFeatures("hist-ohm", { sourceLayer: "boundaries" }))
+      if (String(f.properties?.osm_id) === empireId && f.properties)
+        return toPicked(f.properties);
+  return { osmId: asId(empireId), name: "Empire", adminLevel: ROOT_LEVEL };
+}
+
 /**
  * Set hover/selected on a group across BOTH dataset sources: a member is drawn
  * natively from hist-ohm when the edit is parent-only, or from the hist-edits
@@ -781,8 +828,14 @@ function setSelected(hit: Hit | null) {
   if (!src) return;
   picked = { layer: hit.layer, id: hit.f.id };
   map.setFeatureState(stateRef(src, sl, hit.f.id), { selected: true });
-  pickedGroup = membersOf(hit.f.id);
+  pickedGroup = highlightGroup(hit.f.id);
   if (pickedGroup.length) setGroupState(pickedGroup, "selected", true);
+}
+
+/** Select an empire by id (its whole territory), for a click that landed on one
+ *  of its detached members at the world view. */
+function selectEmpire(empireId: string) {
+  setSelected({ layer: "ohm-fill", source: null as never, f: { id: asId(empireId) } as never });
 }
 
 function bindHover() {
@@ -811,8 +864,8 @@ function bindHover() {
     if (src) {
       hot = { layer: hit.layer, id: hit.f.id };
       map.setFeatureState(stateRef(src, sl, hit.f.id), { hover: true });
-      // The empire and its assigned members hover as one.
-      hotGroup = membersOf(hit.f.id);
+      // Hovering an empire OR one of its members animates the whole territory.
+      hotGroup = highlightGroup(hit.f.id);
       if (hotGroup.length) setGroupState(hotGroup, "hover", true);
     }
     map.getCanvas().style.cursor = "pointer";
@@ -849,16 +902,16 @@ function hitsAt(point: maplibregl.PointLike): Hit[] {
   const ancestors = new Set(focus.trail.map((t) => String(t.osmId)));
   const isClaim = new Set(claims.map(String));
 
-  // At the world view, a region the user assigned to an empire is not clickable
-  // on its own — clicking it should reach the empire, not the member. That is
-  // the "not instantly clickable unless the empire is clicked" rule: the member
-  // stays drawn and highlights with its empire, but you select it only after
-  // drilling in, where the trail is no longer empty and this set is skipped.
-  const grouped =
-    !editMode && !focus.trail.length
-      ? new Set(parentOverrides(currentSourceId()).keys())
+  // Drilled in, only the focused polity's own subtree is selectable. Everything
+  // else — sibling empires, unrelated countries — stays drawn for context but is
+  // LOCKED: inside the British Empire you must not be able to click into the
+  // French Colonial Empire, which is no child of it. The allow-list is exactly
+  // that subtree (see focus.ts); at the world view there is no restriction.
+  const restrict =
+    !editMode && focus.trail.length
+      ? new Set((focus.allow ?? []).map(String))
       : null;
-  const ungrouped = (id: string) => !grouped?.has(id);
+  const selectable = (id: string) => !restrict || restrict.has(id);
 
   // Edits win the click. They are drawn over the dataset and are what the user
   // most recently asserted is true, so a corrected region must be the thing you
@@ -870,7 +923,7 @@ function hitsAt(point: maplibregl.PointLike): Hit[] {
       const seen = new Map<string, Hit>();
       for (const f of raw) {
         const id = String(f.properties?.osm_id ?? "");
-        if (!seen.has(id) && ungrouped(id) && s)
+        if (!seen.has(id) && selectable(id) && s)
           seen.set(id, { layer: "edit-fill", source: s, f });
       }
       if (seen.size) return [...seen.values()];
@@ -904,11 +957,8 @@ function hitsAt(point: maplibregl.PointLike): Hit[] {
     // a country with no mapped subdivisions would make it unclickable.
     const withoutAncestors = list.filter(([id]) => !ancestors.has(id));
     if (withoutAncestors.length) list = withoutAncestors;
-    // Empire members are not clickable on their own at the world view. Dropped
-    // unconditionally: unlike ancestors, a member that swallows the click is
-    // never the thing you meant to select there — the empire beneath or beside
-    // it is.
-    list = list.filter(([id]) => ungrouped(id));
+    // Lock to the focused subtree when drilled in.
+    list = list.filter(([id]) => selectable(id));
 
     list.sort(
       ([, a], [, b]) =>
@@ -965,6 +1015,17 @@ function bindClick(onPick: (p: Picked | null, others: Picked[]) => void) {
       return;
     }
 
+    // At the world view, clicking a member opens its EMPIRE, not the member —
+    // the member is the empire's territory, so the empire is what you meant.
+    const empire =
+      hits[0]?.f.id !== undefined && !focus.trail.length
+        ? parentEmpireOf(hits[0].f.id)
+        : null;
+    if (empire !== null) {
+      selectEmpire(empire);
+      return onPick(empirePicked(empire), []);
+    }
+
     setSelected(hits[0] ?? null);
     const stack = hits.map((h) => toPicked(h.f.properties!));
     // Clicking away from every polity is a deselect, and a deselect returns to
@@ -977,7 +1038,13 @@ function bindClick(onPick: (p: Picked | null, others: Picked[]) => void) {
   map.on("dblclick", (e) => {
     const hit = topmost(e.point);
     if (!hit?.f.properties) return;
-    void drillInto(toPicked(hit.f.properties));
+    // Double-clicking a member drills into its empire, same logic as the single
+    // click: the member stands in for the empire at the world view.
+    const empire =
+      hit.f.id !== undefined && !focus.trail.length
+        ? parentEmpireOf(hit.f.id)
+        : null;
+    void drillInto(empire !== null ? empirePicked(empire) : toPicked(hit.f.properties));
   });
 
   // Named + removed first: initMap re-runs under HMR, and an anonymous listener
