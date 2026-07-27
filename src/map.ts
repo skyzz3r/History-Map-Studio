@@ -683,27 +683,75 @@ const SRC_ID: Record<string, string> = {
  * reads it through the shared helpers in sources.ts.
  */
 let picked: { layer: string; id: string | number } | null = null;
+let pickedGroup: (string | number)[] = [];
+
+/**
+ * The regions the user assigned to `parentId`, so an empire and its members
+ * light up as one. A detached colony like the State of Brazil is a separate
+ * polygon from the Portuguese Empire — geometry alone can never join them — so
+ * the parent edit is the only thing that says they belong together, and this is
+ * what makes selecting the empire show its true extent.
+ */
+function membersOf(parentId: string | number): (string | number)[] {
+  const pid = String(parentId);
+  const out: (string | number)[] = [];
+  for (const [child, parent] of parentOverrides(currentSourceId())) {
+    if (parent !== pid) continue;
+    const n = Number(child);
+    out.push(Number.isFinite(n) && child.trim() !== "" ? n : child);
+  }
+  return out;
+}
+
+/**
+ * Set hover/selected on a group across BOTH dataset sources: a member is drawn
+ * natively from hist-ohm when the edit is parent-only, or from the hist-edits
+ * overlay when it also has a display edit. Writing to a source where the id is
+ * absent is a harmless no-op.
+ */
+function setGroupState(
+  ids: (string | number)[],
+  key: "selected" | "hover",
+  on: boolean,
+) {
+  for (const id of ids) {
+    if (map.getSource("hist-ohm"))
+      map.setFeatureState(
+        { source: "hist-ohm", sourceLayer: "boundaries", id },
+        { [key]: on },
+      );
+    if (map.getSource("hist-edits"))
+      map.setFeatureState({ source: "hist-edits", id }, { [key]: on });
+  }
+}
 
 function setSelected(hit: Hit | null) {
   if (picked) {
     const [src, sl] = SRC_OF[picked.layer] ?? [];
     if (src) map.setFeatureState(stateRef(src, sl, picked.id), { selected: false });
   }
+  if (pickedGroup.length) setGroupState(pickedGroup, "selected", false);
+  pickedGroup = [];
   picked = null;
   if (!hit || hit.f.id === undefined) return;
   const [src, sl] = SRC_OF[hit.layer] ?? [];
   if (!src) return;
   picked = { layer: hit.layer, id: hit.f.id };
   map.setFeatureState(stateRef(src, sl, hit.f.id), { selected: true });
+  pickedGroup = membersOf(hit.f.id);
+  if (pickedGroup.length) setGroupState(pickedGroup, "selected", true);
 }
 
 function bindHover() {
   let hot: { layer: string; id: string | number } | null = null;
+  let hotGroup: (string | number)[] = [];
   const clear = () => {
     if (hot) {
       const [src, sl] = SRC_OF[hot.layer] ?? [];
       if (src) map.setFeatureState(stateRef(src, sl, hot.id), { hover: false });
     }
+    if (hotGroup.length) setGroupState(hotGroup, "hover", false);
+    hotGroup = [];
     hot = null;
   };
 
@@ -720,6 +768,9 @@ function bindHover() {
     if (src) {
       hot = { layer: hit.layer, id: hit.f.id };
       map.setFeatureState(stateRef(src, sl, hit.f.id), { hover: true });
+      // The empire and its assigned members hover as one.
+      hotGroup = membersOf(hit.f.id);
+      if (hotGroup.length) setGroupState(hotGroup, "hover", true);
     }
     map.getCanvas().style.cursor = "pointer";
   });
