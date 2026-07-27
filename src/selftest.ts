@@ -27,7 +27,12 @@ import {
   tipLevel,
   type FocusState,
 } from "./focus.ts";
-import { normaliseCShapes, normaliseHB, normaliseSources } from "./sources.ts";
+import {
+  normaliseCShapes,
+  normaliseHB,
+  normaliseSources,
+  OCEAN_KINDS,
+} from "./sources.ts";
 // The tile pipeline is plain .mjs so CI can run it with no bundler; it has no
 // types. Tested here anyway — its id signing is the one thing that can produce
 // tiles that look perfectly healthy and resolve nothing.
@@ -660,6 +665,14 @@ assert.deepEqual(
   "an overlay alone still needs a dataset under it",
 );
 assert.deepEqual(normaliseSources(["nonsense"]), ["ohm"], "unknown ids drop out");
+
+// --- coastline clip masks salt water only ----------------------------------
+// The Great-Lakes-preserving invariant: masking these hides the sea spill but
+// leaves inland borders. If "lake" or "river" ever creep in, the US–Canada
+// Great Lakes border silently vanishes.
+assert.ok(OCEAN_KINDS.includes("bay"), "Hudson Bay must be masked");
+assert.ok(!OCEAN_KINDS.includes("lake"), "lakes stay: keeps the Great Lakes border");
+assert.ok(!OCEAN_KINDS.includes("river"), "rivers stay drawn");
 
 // --- childIds hands the diagram real names ---------------------------------
 const named = childIds(

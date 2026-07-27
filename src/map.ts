@@ -12,6 +12,7 @@ import { flagFileFor, normFile, thumbUrls } from "./wikidata.ts";
 import {
   BASEMAP_TILES,
   HATCH,
+  OCEAN_KINDS,
   SOURCES,
   dateFilter,
   detectOhm,
@@ -54,6 +55,15 @@ const PRESENT_DAY = /^(boundaries|places_country|places_region)/;
 
 const GLYPHS =
   "https://protomaps.github.io/basemaps-assets/fonts/{fontstack}/{range}.pbf";
+
+// Coastline clip. OHM boundary polygons include territorial waters, so a
+// country's fill and border line spill ~200 nm offshore (worst on Canada). The
+// clip paints the sea back over the top, below labels, so the visible edge of
+// every territory becomes the coastline. OCEAN_KINDS (salt water only, so lake
+// borders like the Great Lakes survive) lives in sources.ts, node-testable.
+const CLIP_STORE = "clip";
+export const savedClip = () => localStorage.getItem(CLIP_STORE) === "1";
+let clip = savedClip();
 
 // ---------------------------------------------------------------------------
 // State
@@ -281,11 +291,62 @@ async function addHistoryLayers() {
     }
     if (coarse) setCoarse(coarse);
     addLabelLayer();
+    // After the label layer so the mask can anchor beneath it, and inside the
+    // styledata re-attach path so it survives every basemap swap and re-samples
+    // the new flavour's water colour.
+    if (clip) ensureClipMask();
     applyFilters();
     queueLabels();
   } finally {
     attaching = false;
   }
+}
+
+/**
+ * The coastline clip: an opaque sea fill drawn over the border layers, below the
+ * labels, so each territory's over-water spill is hidden and the visible border
+ * follows the coast. Own source (BASEMAP_TILES), so it works on every basemap —
+ * including None/OHM, which have no Protomaps water layer of their own.
+ *
+ * Two accepted costs while on: the basemap's ocean name labels are covered, and
+ * the coast shown is the modern OSM one, not the era's (a reclaimed Zuiderzee or
+ * a full Aral Sea reads as present-day).
+ */
+function ensureClipMask() {
+  if (!map.getSource("hist-ocean"))
+    map.addSource("hist-ocean", {
+      type: "vector",
+      url: BASEMAP_TILES,
+      attribution: "© OpenStreetMap, Protomaps",
+    } as never);
+
+  if (map.getLayer("ocean-mask")) return;
+  // Seamless where the basemap draws water; a dark sea elsewhere (None/OHM).
+  const c = map.getLayer("water") && map.getPaintProperty("water", "fill-color");
+  map.addLayer(
+    {
+      id: "ocean-mask",
+      type: "fill",
+      source: "hist-ocean",
+      "source-layer": "water",
+      filter: ["all", ["==", "$type", "Polygon"], ["in", "kind", ...OCEAN_KINDS]],
+      paint: {
+        "fill-color": (typeof c === "string" ? c : "#0b1220") as never,
+        "fill-opacity": 1,
+      },
+    },
+    // Above every border layer (all added before hist-label), below the labels.
+    map.getLayer("hist-label") ? "hist-label" : undefined,
+  );
+}
+
+/** Toggle the coastline clip. Self-contained, like setGlobe. */
+export function setClip(on: boolean) {
+  clip = on;
+  localStorage.setItem(CLIP_STORE, on ? "1" : "0");
+  if (!map) return;
+  if (on) ensureClipMask();
+  else if (map.getLayer("ocean-mask")) map.removeLayer("ocean-mask");
 }
 
 /**

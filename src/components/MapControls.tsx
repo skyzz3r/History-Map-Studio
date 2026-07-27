@@ -1,5 +1,13 @@
 import { useState } from "react";
-import { BASEMAPS, savedBasemap, setBasemap, setGlobe, setSources } from "../map.ts";
+import {
+  BASEMAPS,
+  savedBasemap,
+  savedClip,
+  setBasemap,
+  setClip,
+  setGlobe,
+  setSources,
+} from "../map.ts";
 import { SOURCES, isOverlay, savedSources } from "../sources.ts";
 
 /**
@@ -22,6 +30,7 @@ export default function MapControls() {
   // initMap has populated that, so reading it there left every box unchecked
   // while OHM and Historical-Basemaps were plainly rendering.
   const [on, setOn] = useState<string[]>(savedSources);
+  const [clip, setClipOn] = useState(savedClip);
   const [open, setOpen] = useState(false);
 
   const pick = (v: string) => {
@@ -123,6 +132,28 @@ export default function MapControls() {
               </li>
             ))}
           </ul>
+
+          {/* A render option, not a dataset: clips whichever borders are shown
+              to the coastline by masking the sea. */}
+          <label className="flex cursor-pointer items-start gap-2 border-t border-neutral-800 pt-2">
+            <input
+              type="checkbox"
+              checked={clip}
+              onChange={() => {
+                const next = !clip;
+                setClipOn(next);
+                setClip(next);
+              }}
+              className="mt-1 accent-neutral-100"
+            />
+            <span>
+              <span className="text-neutral-100">Clip borders to coastline</span>
+              <span className="block text-xs leading-snug text-neutral-500">
+                Hide each territory's sea area so borders follow the coast. Keeps
+                lake borders (e.g. the Great Lakes).
+              </span>
+            </span>
+          </label>
         </div>
       )}
 

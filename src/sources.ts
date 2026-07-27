@@ -501,6 +501,15 @@ export const BASEMAP_TILES =
   "pmtiles://https://data.source.coop/protomaps/openstreetmap/v4.pmtiles";
 
 /**
+ * Salt-water `kind` values in the Protomaps v4 `water` layer, used by the
+ * coastline clip (see map.ts). Verified against @protomaps/basemaps: it labels
+ * exactly {ocean, sea, bay, strait, fjord} as salt water and keeps lakes/rivers
+ * separate — so masking these strips the sea spill but leaves inland borders
+ * like the Great Lakes US–Canada line drawn. MUST NOT include "lake"/"river".
+ */
+export const OCEAN_KINDS = ["ocean", "sea", "bay", "strait", "fjord"];
+
+/**
  * Today's borders as a tracing-paper reference over the historical ones.
  *
  * This used to be "stop stripping the basemap's own boundary layers", which had
