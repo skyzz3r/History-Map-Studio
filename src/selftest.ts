@@ -16,8 +16,18 @@ import {
 } from "./geo.ts";
 import { buildLabelPoints } from "./labels.ts";
 import { bboxArea, claimsFrom, overlappingIds, type Sample } from "./claims.ts";
-import { childIds, focusFilter, inBounds, mergeAllow, nextLevel } from "./focus.ts";
-import { normaliseCShapes, normaliseHB } from "./sources.ts";
+import {
+  childIds,
+  coveredIds,
+  focusFilter,
+  inBounds,
+  initialFocus,
+  mergeAllow,
+  nextLevel,
+  tipLevel,
+  type FocusState,
+} from "./focus.ts";
+import { normaliseCShapes, normaliseHB, normaliseSources } from "./sources.ts";
 // The tile pipeline is plain .mjs so CI can run it with no bundler; it has no
 // types. Tested here anyway — its id signing is the one thing that can produce
 // tiles that look perfectly healthy and resolve nothing.
@@ -213,24 +223,29 @@ assert.deepEqual(
   [],
 );
 
-// --- focus: countries stay visible, deeper levels are gated ---
-assert.deepEqual(focusFilter({ trail: [], maxLevel: 2, allow: null }),
-  ["<=", ["coalesce", ["get", "admin_level"], 99], 2]);
-// With an allow-list, level<=2 still passes so the parent keeps its context.
-const gated: any = focusFilter({ trail: [], maxLevel: 4, allow: [7, 8] });
-assert.equal(gated[0], "all");
-assert.deepEqual(gated[2][2], ["in", ["get", "osm_id"], ["literal", [7, 8]]]);
+// focusFilter's admitted set is asserted further down, by evaluating the
+// expression against real feature properties instead of matching its shape.
+// The shape assertions that used to live here broke on every internal change
+// while proving nothing about which features actually draw.
 
-// The subdivisions tier is the one with the MOST members, not the shallowest.
-// Drilling into Prussia really did find a single admin_level 3 feature (Neutral
-// Moresnet) beside a dozen level-4 provinces; taking the shallowest showed
-// Moresnet alone and hid every province.
+// The subdivisions tier is the SHALLOWEST one with more than a single member.
+// Prussia has one admin_level 3 feature (Neutral Moresnet) beside a dozen
+// level-4 provinces, so a plain "shallowest" showed Moresnet alone.
 assert.equal(nextLevel(2, new Map([[3, 1], [4, 12]])), 4, "12 provinces beat 1 oddity");
-assert.equal(nextLevel(2, new Map([[4, 5], [6, 40]])), 6, "deeper tier can win");
+// ...but "most members" is wrong too, and this is the case that proved it on the
+// live map: France resolved 189 level-8 communes instead of its 13 régions.
+assert.equal(
+  nextLevel(2, new Map([[4, 13], [6, 96], [8, 189]])),
+  4,
+  "régions are France's subdivisions; communes are not",
+);
+assert.equal(nextLevel(2, new Map([[4, 5], [6, 40]])), 4, "shallowest real tier wins");
 assert.equal(nextLevel(2, new Map([[2, 90]])), 2, "nothing deeper -> stay put");
 assert.equal(nextLevel(2, new Map()), 2, "no children -> stay put");
-// Ties go to the shallower tier, which is the more useful default.
 assert.equal(nextLevel(2, new Map([[4, 7], [6, 7]])), 4);
+// Every candidate tier is a singleton: fall back to the shallowest rather than
+// resolving nothing at all.
+assert.equal(nextLevel(2, new Map([[5, 1], [7, 1]])), 5);
 
 // Why childIds does point-in-polygon and NOT a bounding box. Prussia's real
 // bbox (47.6-55.9N, 5.9-22.9E) contains southern Denmark, and the first version
@@ -352,8 +367,17 @@ assert.equal(hbLabels.features.length, 2, "string ids dedupe too");
 // --- allow: [] and allow: null are NOT the same filter ---
 // Getting this wrong put every province on Earth on screen: an opened maxLevel
 // with no restriction. `[]` means "resolved, nothing qualifies".
-const openNull = JSON.stringify(focusFilter({ trail: [], maxLevel: 4, allow: null }));
-const openEmpty = JSON.stringify(focusFilter({ trail: [], maxLevel: 4, allow: [] }));
+//
+// The trail is what makes an allow-list meaningful — with an empty trail you are
+// at the world view, which has no parent to be inside of.
+const drilled = {
+  trail: [{ osmId: -100, name: "Prussia", adminLevel: 2 }],
+  maxLevel: 4,
+  children: [],
+  resolved: true,
+};
+const openNull = JSON.stringify(focusFilter({ ...drilled, allow: null }));
+const openEmpty = JSON.stringify(focusFilter({ ...drilled, allow: [] }));
 assert.notEqual(openNull, openEmpty, "empty allow must restrict, null must not");
 assert.ok(openEmpty.includes('"literal"'), "empty allow still emits an id test");
 
@@ -466,5 +490,196 @@ assert.equal(osmIdOf({ id: "w4242", properties: {} }), 4242);
 assert.equal(osmIdOf({ properties: { "@id": 7, "@type": "way", type: "boundary" } }), 7);
 assert.equal(osmIdOf({ properties: {} }), null);
 assert.equal(osmIdOf({ properties: { "@id": "junk" } }), null);
+
+// --- the hierarchy filter, actually evaluated -------------------------------
+//
+// focusFilter returns a MapLibre expression, and asserting on its SHAPE proves
+// nothing about what it admits. This evaluates the subset it uses against real
+// feature properties, so every case below is the question the GPU asks.
+
+type Props = Record<string, unknown>;
+
+function evalExpr(e: unknown, p: Props): any {
+  if (!Array.isArray(e)) return e;
+  const [op, ...a] = e as [string, ...unknown[]];
+  const v = (x: unknown) => evalExpr(x, p);
+  switch (op) {
+    case "all": return a.every((x) => v(x) === true);
+    case "any": return a.some((x) => v(x) === true);
+    case "!": return v(a[0]) !== true;
+    case "get": return p[a[0] as string];
+    case "literal": return a[0];
+    case "coalesce": {
+      for (const x of a) {
+        const r = v(x);
+        if (r !== undefined && r !== null) return r;
+      }
+      return undefined;
+    }
+    case "in": return (v(a[1]) as unknown[]).includes(v(a[0]));
+    case "<=": return Number(v(a[0])) <= Number(v(a[1]));
+    case ">=": return Number(v(a[0])) >= Number(v(a[1]));
+    case "==": return v(a[0]) === v(a[1]);
+    default: throw new Error(`unhandled op in test evaluator: ${op}`);
+  }
+}
+const admits = (f: FocusState, p: Props, covered: number[] = []) =>
+  evalExpr(focusFilter(f, covered), p) === true;
+
+const EMPIRE = { admin_level: 1, osm_id: -1 };
+const MEMBER = { admin_level: 2, osm_id: -2 };
+const LONER = { admin_level: 2, osm_id: -3 };
+const PROVINCE = { admin_level: 4, osm_id: -4 };
+// A real one, from OHM: way 198568873, maritime=yes, type=boundary, no
+// admin_level at all. prepare.mjs used to coerce that to 0.
+const NM_LINE = { admin_level: 0, osm_id: 198568873, name: "6nm line - Greece" };
+const NM_UNTAGGED = { osm_id: 198304712, name: "3nm line - Ryukyu Islands" };
+
+const world = initialFocus();
+assert.equal(admits(world, EMPIRE), true, "world view shows empires");
+assert.equal(admits(world, LONER), true, "world view shows independent countries");
+assert.equal(admits(world, PROVINCE), false, "world view stops at countries");
+// The reported artifacts. Both forms must be rejected by the same clause.
+assert.equal(admits(world, NM_LINE), false, "12nm-style limit lines are not polities");
+assert.equal(admits(world, NM_UNTAGGED), false, "a missing admin_level is not level 0");
+
+// An empire stands in for its members, so the world view is not a soup.
+assert.equal(admits(world, MEMBER, [-2]), false, "covered member hides at world view");
+assert.equal(admits(world, EMPIRE, [-2]), true, "the empire itself still draws");
+assert.equal(admits(world, LONER, [-2]), true, "an uncovered country is untouched");
+
+// Drilling into the empire must bring exactly those members back — and NOT
+// every country on Earth, which is what a hardcoded "al <= 2" context did.
+const inEmpire: FocusState = {
+  trail: [{ osmId: -1, name: "British Empire", adminLevel: 1 }],
+  maxLevel: 2,
+  allow: [-2],
+  children: [],
+  resolved: true,
+};
+assert.equal(admits(inEmpire, MEMBER, [-2]), true, "drill reveals the member");
+assert.equal(admits(inEmpire, LONER), false, "a country outside the empire stays out");
+assert.equal(admits(inEmpire, EMPIRE), true, "sibling empires remain as context");
+assert.equal(admits(inEmpire, NM_LINE), false, "artifacts stay out at every depth");
+
+// Drilling into a country keeps other countries visible for context, but only
+// its own provinces.
+const inCountry: FocusState = {
+  trail: [{ osmId: -2, name: "Prussia", adminLevel: 2 }],
+  maxLevel: 4,
+  allow: [-4],
+  children: [],
+  resolved: true,
+};
+assert.equal(admits(inCountry, PROVINCE), true, "its own province shows");
+assert.equal(admits(inCountry, LONER), true, "neighbouring countries stay as context");
+assert.equal(
+  admits(inCountry, { admin_level: 4, osm_id: -99 }),
+  false,
+  "a province of some other country must never appear",
+);
+assert.equal(tipLevel(inCountry), 2);
+assert.equal(tipLevel(world), 1, "the world view's tier is the supranational one");
+
+// allow: [] still means "resolved, nothing qualified", not "no restriction".
+assert.equal(
+  admits({ ...inCountry, allow: [] }, PROVINCE),
+  false,
+  "an empty allow-list hides every subdivision",
+);
+
+// --- coveredIds: real point-in-polygon, not a bounding box ------------------
+const sq = (x0: number, y0: number, x1: number, y1: number) => ({
+  type: "Polygon",
+  coordinates: [[[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]],
+});
+const cov = coveredIds([
+  { properties: EMPIRE, geometry: sq(0, 0, 10, 10) },
+  { properties: MEMBER, geometry: sq(1, 1, 3, 3) },
+  { properties: LONER, geometry: sq(20, 20, 22, 22) },
+  { properties: PROVINCE, geometry: sq(1, 1, 2, 2) },
+]);
+assert.deepEqual(cov, [-2], "only level-2 polities inside a level-1 one are covered");
+assert.deepEqual(
+  coveredIds([{ properties: MEMBER, geometry: sq(1, 1, 3, 3) }]),
+  [],
+  "no empire on screen means nothing is covered",
+);
+
+// An enclave inside the union's outer ring but NOT a member: the union's
+// polygon has a hole there. Measured on live tiles first — testing the outer
+// ring alone reported Switzerland, Liechtenstein and Andorra as covered by the
+// European Union, which would have erased three countries from the map.
+const NEUTRAL = { admin_level: 2, osm_id: -7 };
+const holed = {
+  type: "Polygon",
+  coordinates: [
+    [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]],
+    [[4, 4], [6, 4], [6, 6], [4, 6], [4, 4]], // hole: the neutral state
+  ],
+};
+assert.deepEqual(
+  coveredIds([
+    { properties: EMPIRE, geometry: holed },
+    { properties: MEMBER, geometry: sq(1, 1, 3, 3) },
+    { properties: NEUTRAL, geometry: sq(4.2, 4.2, 5.8, 5.8) },
+  ]),
+  [-2],
+  "a country in the union's hole is not covered by it",
+);
+// And the same rule when drilling in: the enclave is not a member state.
+assert.deepEqual(
+  childIds(
+    [
+      { properties: EMPIRE, geometry: holed },
+      { properties: MEMBER, geometry: sq(1, 1, 3, 3) },
+      { properties: NEUTRAL, geometry: sq(4.2, 4.2, 5.8, 5.8) },
+    ],
+    -1,
+    1,
+  ).ids,
+  [-2],
+  "drilling into the union lists members, not enclaves",
+);
+
+// --- one dataset at a time -------------------------------------------------
+assert.deepEqual(normaliseSources(["ohm"]), ["ohm"]);
+assert.deepEqual(
+  normaliseSources(["ohm", "hb"]),
+  ["hb"],
+  "two datasets collapse to the last, which is the one just clicked",
+);
+assert.deepEqual(
+  normaliseSources(["ohm", "today"]),
+  ["ohm", "today"],
+  "an overlay is not a dataset and must survive alongside one",
+);
+assert.deepEqual(
+  normaliseSources(["today"]),
+  ["ohm", "today"],
+  "an overlay alone still needs a dataset under it",
+);
+assert.deepEqual(normaliseSources(["nonsense"]), ["ohm"], "unknown ids drop out");
+
+// --- childIds hands the diagram real names ---------------------------------
+const named = childIds(
+  [
+    { properties: { osm_id: -2, admin_level: 2 }, geometry: sq(0, 0, 10, 10) },
+    { properties: { osm_id: -4, admin_level: 4, name: "Brandenburg" }, geometry: sq(1, 1, 2, 2) },
+    { properties: { osm_id: -5, admin_level: 4, "name:en": "Silesia" }, geometry: sq(3, 3, 4, 4) },
+    // No admin_level: an artifact must not be counted as a whole tier.
+    { properties: { osm_id: 1, name: "12nm line - Prussia" }, geometry: sq(5, 5, 6, 6) },
+  ],
+  -2,
+  2,
+);
+assert.deepEqual(named.ids, [-4, -5]);
+assert.deepEqual(
+  named.nodes.map((n) => n.name),
+  ["Brandenburg", "Silesia"],
+  "name:en wins where present, and the diagram gets real labels",
+);
+assert.equal(named.counts.get(4), 2);
+assert.equal(named.counts.size, 1, "the maritime line formed no tier of its own");
 
 console.log("ok");

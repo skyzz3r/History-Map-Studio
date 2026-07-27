@@ -9,6 +9,7 @@
 
 import type { Map as MLMap } from "maplibre-gl";
 import { toDecimalYear } from "./dates.ts";
+import { COUNTRY_LEVEL } from "./focus.ts";
 
 /** Absent start = always existed; absent end = still exists. Never null: a null
  *  loses every numeric comparison and would silently erase the feature. */
@@ -22,6 +23,33 @@ export const dateFilter = (dec: number): any => [
   [">=", ["coalesce", ["get", "end_num"], ["get", "end_decdate"], NO_END], dec],
 ];
 
+/**
+ * ONE hover and selection response for every dataset.
+ *
+ * Each source keeps its own colour — that is useful identity — but the way it
+ * reacts to the pointer is now identical. It used to differ per source: OHM
+ * lifted from a zoom-interpolated 0.10-0.12 to 0.35, Historical-Basemaps from
+ * 0.22 to 0.4, CShapes from 0.16 to 0.4. Switching dataset therefore changed how
+ * the map *felt*, and nothing at all marked the polity you had actually clicked.
+ */
+export const fillOpacity = (base = 0.12): any => [
+  "case",
+  ["boolean", ["feature-state", "selected"], false], 0.5,
+  ["boolean", ["feature-state", "hover"], false], 0.32,
+  base,
+];
+
+/** Country borders heavier than internal ones, selection heavier than both. */
+export const lineWidth = (): any => {
+  const country: any = ["<=", ["coalesce", ["get", "admin_level"], 9], COUNTRY_LEVEL];
+  const selected: any = ["boolean", ["feature-state", "selected"], false];
+  return [
+    "interpolate", ["linear"], ["zoom"],
+    2, ["case", selected, 2.2, country, 0.7, 0.3],
+    10, ["case", selected, 4, country, 2.4, 1],
+  ];
+};
+
 export type Source = {
   id: string;
   label: string;
@@ -29,6 +57,11 @@ export type Source = {
   note?: string;
   /** Non-commercial or otherwise restrictive — off by default, warns on enable. */
   restricted?: boolean;
+  /**
+   * A cosmetic overlay rather than a dataset: stacks on top of whichever border
+   * dataset is chosen instead of replacing it, and never owns hover or click.
+   */
+  overlay?: boolean;
   /** Layer that owns hover/click, or "" for reference-only sources. */
   pickLayer: string;
   /** All hit-testable layers, highest priority first. Defaults to [pickLayer]. */
@@ -213,16 +246,12 @@ const ohm: Source = {
           "fill-color": [
             "case",
             ["has", "disputed_by"], "#d97706",
-            ["==", ["get", "admin_level"], 2], "#e5e7eb",
+            // Empires and unions read as one warm shape at the world view.
+            ["<=", ["coalesce", ["get", "admin_level"], 9], 1], "#a78bfa",
+            ["==", ["get", "admin_level"], COUNTRY_LEVEL], "#e5e7eb",
             "#94a3b8",
           ],
-          // The zoom interpolate MUST be outermost: MapLibre rejects a ["zoom"]
-          // nested inside anything else, and silently drops the whole layer.
-          "fill-opacity": [
-            "interpolate", ["linear"], ["zoom"],
-            2, ["case", ["boolean", ["feature-state", "hover"], false], 0.35, 0.1],
-            10, ["case", ["boolean", ["feature-state", "hover"], false], 0.35, 0.12],
-          ],
+          "fill-opacity": fillOpacity(),
         },
       },
       beforeId,
@@ -238,14 +267,11 @@ const ohm: Source = {
           "line-color": [
             "case",
             ["has", "disputed_by"], "#f59e0b",
-            ["==", ["get", "admin_level"], 2], "#f8fafc",
+            ["<=", ["coalesce", ["get", "admin_level"], 9], 1], "#c4b5fd",
+            ["==", ["get", "admin_level"], COUNTRY_LEVEL], "#f8fafc",
             "#cbd5e1",
           ],
-          "line-width": [
-            "interpolate", ["linear"], ["zoom"],
-            2, ["case", ["==", ["get", "admin_level"], 2], 0.6, 0.2],
-            10, ["case", ["==", ["get", "admin_level"], 2], 2.4, 1],
-          ],
+          "line-width": lineWidth(),
           "line-opacity": 0.9,
         },
       },
@@ -355,14 +381,7 @@ const hb: Source = {
         id: "hb-fill",
         type: "fill",
         source: "hist-hb",
-        paint: {
-          "fill-color": "#64748b",
-          "fill-opacity": [
-            "case",
-            ["boolean", ["feature-state", "hover"], false], 0.4,
-            0.22,
-          ],
-        },
+        paint: { "fill-color": "#64748b", "fill-opacity": fillOpacity() },
       },
       beforeId,
     );
@@ -371,7 +390,11 @@ const hb: Source = {
         id: "hb-line",
         type: "line",
         source: "hist-hb",
-        paint: { "line-color": "#cbd5e1", "line-width": 0.6, "line-opacity": 0.7 },
+        paint: {
+          "line-color": "#cbd5e1",
+          "line-width": lineWidth(),
+          "line-opacity": 0.9,
+        },
       },
       beforeId,
     );
@@ -429,14 +452,7 @@ const cshapes: Source = {
         id: "cs-fill",
         type: "fill",
         source: "hist-cs",
-        paint: {
-          "fill-color": "#0ea5e9",
-          "fill-opacity": [
-            "case",
-            ["boolean", ["feature-state", "hover"], false], 0.4,
-            0.16,
-          ],
-        },
+        paint: { "fill-color": "#0ea5e9", "fill-opacity": fillOpacity() },
       },
       beforeId,
     );
@@ -445,7 +461,11 @@ const cshapes: Source = {
         id: "cs-line",
         type: "line",
         source: "hist-cs",
-        paint: { "line-color": "#7dd3fc", "line-width": 0.9, "line-opacity": 0.85 },
+        paint: {
+          "line-color": "#7dd3fc",
+          "line-width": lineWidth(),
+          "line-opacity": 0.9,
+        },
       },
       beforeId,
     );
@@ -473,32 +493,113 @@ const cshapes: Source = {
 // ---------------------------------------------------------------------------
 
 /**
- * Costs nothing: boundaries_country / boundaries / places_country are already
- * inside the Protomaps tiles the basemap downloads. The CLUTTER regex in map.ts
- * normally discards them, since present-day borders contradict whatever era is
- * on screen. Enabling this source just stops discarding them.
+ * Source Cooperative's mirror of the Protomaps planet. NOT build.protomaps.com,
+ * whose bucket only sends CORS for localhost origins — it works in dev and fails
+ * silently the moment the site is deployed.
+ */
+export const BASEMAP_TILES =
+  "pmtiles://https://data.source.coop/protomaps/openstreetmap/v4.pmtiles";
+
+/**
+ * Today's borders as a tracing-paper reference over the historical ones.
+ *
+ * This used to be "stop stripping the basemap's own boundary layers", which had
+ * two faults. It was INVISIBLE — the basemap draws them as a dark hairline meant
+ * to sit under labels, and our translucent fills went straight over the top. And
+ * it only existed on the Protomaps basemaps: on `None` or OHM Historical there
+ * were no such layers to un-strip, so the toggle did nothing at all.
+ *
+ * Now it owns a source and two layers of its own, so it looks the same over
+ * every basemap. Cosmetic by contract: `pickLayer` is "" and `overlay` is true,
+ * so `pickable()` never includes it and no territory here is clickable.
  */
 const today: Source = {
   id: "today",
   label: "Present day (reference)",
-  note: "From the basemap tiles already loaded. No date filtering — always today.",
+  note: "Cosmetic overlay. Today's borders on top of the era you are viewing — not clickable.",
+  overlay: true,
   pickLayer: "",
-  layers: [],
-  attach() {},
+  layers: ["today-line", "today-line-sub"],
+
+  attach(map, beforeId) {
+    if (!map.getSource("hist-today"))
+      map.addSource("hist-today", {
+        type: "vector",
+        url: BASEMAP_TILES,
+        attribution: "© OpenStreetMap, Protomaps",
+      } as never);
+
+    // Internal borders first, so country lines draw over them.
+    map.addLayer(
+      {
+        id: "today-line-sub",
+        type: "line",
+        source: "hist-today",
+        "source-layer": "boundaries",
+        filter: [">", ["get", "kind_detail"], 2],
+        paint: {
+          "line-color": "#22d3ee",
+          "line-width": 0.6,
+          "line-opacity": 0.35,
+          "line-dasharray": [2, 3],
+        },
+      },
+      beforeId,
+    );
+    // kind_detail <= 2 is the country tier in the Protomaps v4 schema.
+    map.addLayer(
+      {
+        id: "today-line",
+        type: "line",
+        source: "hist-today",
+        "source-layer": "boundaries",
+        filter: ["<=", ["get", "kind_detail"], 2],
+        paint: {
+          "line-color": "#22d3ee",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 2, 0.9, 10, 2],
+          "line-opacity": 0.75,
+          "line-dasharray": [3, 2],
+        },
+      },
+      beforeId,
+    );
+  },
 };
 
 export const SOURCES: Source[] = [ohm, hb, cshapes, today];
 
+/** The mutually exclusive border datasets — everything that is not an overlay. */
+export const isOverlay = (id: string) =>
+  !!SOURCES.find((s) => s.id === id)?.overlay;
+
 const STORE = "sources";
-// OHM only. Having Historical-Basemaps on by default meant two disagreeing sets
-// of borders painted over each other everywhere OHM already had coverage; it is
-// worth enabling deliberately for ancient dates, not permanently.
+// OHM only. Two disagreeing sets of borders painted over each other everywhere
+// both had coverage, which is also why the picker is now single-choice.
 const DEFAULT = ["ohm"];
+
+/**
+ * Enforce "exactly one border dataset, plus any cosmetic overlays".
+ *
+ * Layering two datasets was the old design and it was a mistake: OHM and
+ * Historical-Basemaps disagree about the same borders, so wherever both had
+ * coverage the map drew two contradictory sets of lines and the pick order
+ * decided which one your click got. The last dataset in the list wins, which
+ * makes "the one just clicked" the survivor.
+ *
+ * Also migrates a multi-dataset selection saved by the old build.
+ */
+export function normaliseSources(ids: string[]): string[] {
+  const known = ids.filter((id) => SOURCES.some((s) => s.id === id));
+  const datasets = known.filter((id) => !isOverlay(id));
+  const overlays = [...new Set(known.filter(isOverlay))];
+  const pick = datasets.length ? datasets[datasets.length - 1] : DEFAULT[0];
+  return [pick, ...overlays];
+}
 
 export function savedSources(): string[] {
   try {
     const v = JSON.parse(localStorage.getItem(STORE) ?? "null");
-    return Array.isArray(v) && v.length ? v : DEFAULT;
+    return normaliseSources(Array.isArray(v) && v.length ? v : DEFAULT);
   } catch {
     return DEFAULT;
   }

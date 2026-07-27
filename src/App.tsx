@@ -1,6 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { loadIndex, yearAt } from "./borders.ts";
-import { bindFocusChange, drillOut, getFocus, initMap, type Picked } from "./map.ts";
+import {
+  bindFocusChange,
+  drillInto,
+  drillOut,
+  getFocus,
+  initMap,
+  resetFocus,
+  type Picked,
+} from "./map.ts";
 import { applyIndex, getIndex } from "./scrub.ts";
 import { lookup, lookupByQid, type Info } from "./wikidata.ts";
 import { cachedTags, enTitleOf, fetchTags, qidOf } from "./ohm.ts";
@@ -10,7 +18,7 @@ import Timeline from "./components/Timeline.tsx";
 import SideSheet from "./components/SideSheet.tsx";
 import StudioBar from "./components/StudioBar.tsx";
 import MapControls from "./components/MapControls.tsx";
-import Breadcrumb from "./components/Breadcrumb.tsx";
+import HierarchyPanel from "./components/HierarchyPanel.tsx";
 
 export default function App() {
   const container = useRef<HTMLDivElement>(null);
@@ -23,6 +31,14 @@ export default function App() {
   const [studio, setStudio] = useState(false);
   const [keys, setKeys] = useState<Key[]>([]);
   const [focus, setFocus] = useState<FocusState>(initialFocus);
+  const [tree, setTree] = useState(true);
+
+  /** Clearing the selection returns to the top of the hierarchy. */
+  const deselect = () => {
+    setPicked(null);
+    setOthers([]);
+    resetFocus();
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -102,11 +118,38 @@ export default function App() {
             {error}
           </span>
         )}
-        <Breadcrumb focus={focus} onJump={drillOut} />
+        {/* The breadcrumb lived here and was deleted: the hierarchy panel shows
+            the same spine, with the tiers named and the children listed, and two
+            controls carrying the same aria-label was its own bug. */}
+        {!tree && (
+          <button
+            onClick={() => setTree(true)}
+            className="pointer-events-auto rounded-lg bg-neutral-900/80 px-3 py-1.5 text-sm backdrop-blur hover:bg-neutral-800"
+          >
+            Hierarchy
+          </button>
+        )}
         <div className="ml-auto">
           <MapControls />
         </div>
       </header>
+
+      {tree && (
+        <div className="absolute left-4 top-20 z-10">
+          <HierarchyPanel
+            focus={focus}
+            onJump={drillOut}
+            onDrill={(n) =>
+              void drillInto({
+                osmId: n.osmId,
+                name: n.name,
+                adminLevel: n.adminLevel,
+              })
+            }
+            onClose={() => setTree(false)}
+          />
+        </div>
+      )}
 
       {studio && <StudioBar keys={keys} setKeys={setKeys} max={count - 1} />}
 
@@ -123,7 +166,7 @@ export default function App() {
             setOthers([picked, ...others.filter((o) => o.osmId !== p.osmId)]);
             setPicked(p);
           }}
-          onClose={() => setPicked(null)}
+          onClose={deselect}
         />
       )}
     </div>

@@ -1,11 +1,18 @@
 import { useState } from "react";
 import { BASEMAPS, savedBasemap, setBasemap, setGlobe, setSources } from "../map.ts";
-import { SOURCES, savedSources } from "../sources.ts";
+import { SOURCES, isOverlay, savedSources } from "../sources.ts";
 
 /**
- * Data sources, backdrop and projection. Sources are checkboxes, not a radio:
- * no single open dataset covers all of history, so layering OHM's precision
- * over Historical-Basemaps' reach is the normal case.
+ * Data sources, backdrop and projection.
+ *
+ * ONE border dataset at a time, as a radio. These used to be checkboxes on the
+ * theory that layering OHM's precision over Historical-Basemaps' reach was
+ * useful — in practice the two disagree about the same borders, so wherever both
+ * had coverage the map drew two contradictory sets of lines and pick order
+ * silently decided which one a click landed on.
+ *
+ * Overlays (present day) are separate checkboxes: they stack on top of whichever
+ * dataset is chosen and are cosmetic, never clickable.
  */
 export default function MapControls() {
   const [choice, setChoice] = useState(savedBasemap);
@@ -22,17 +29,31 @@ export default function MapControls() {
     setBasemap(v);
   };
 
-  const toggle = (id: string, restricted?: boolean) => {
-    const next = on.includes(id) ? on.filter((x) => x !== id) : [...on, id];
-    if (restricted && !on.includes(id)) {
-      const s = SOURCES.find((x) => x.id === id);
-      // A licence that forbids commercial use is not something to discover
-      // later, so it is confirmed the first time it is switched on.
-      if (!confirm(`${s?.label}\n\n${s?.note}\n\nEnable this source?`)) return;
-    }
+  const confirmRestricted = (id: string, restricted?: boolean) => {
+    if (!restricted || on.includes(id)) return true;
+    const s = SOURCES.find((x) => x.id === id);
+    // A licence that forbids commercial use is not something to discover later,
+    // so it is confirmed the first time it is switched on.
+    return confirm(`${s?.label}\n\n${s?.note}\n\nEnable this source?`);
+  };
+
+  /** Pick the one border dataset, keeping whatever overlays are on. */
+  const choose = (id: string, restricted?: boolean) => {
+    if (!confirmRestricted(id, restricted)) return;
+    const next = [id, ...on.filter(isOverlay)];
     setOn(next);
     void setSources(next);
   };
+
+  const toggleOverlay = (id: string) => {
+    const next = on.includes(id) ? on.filter((x) => x !== id) : [...on, id];
+    setOn(next);
+    void setSources(next);
+  };
+
+  const datasets = SOURCES.filter((s) => !s.overlay);
+  const overlays = SOURCES.filter((s) => s.overlay);
+  const current = on.find((id) => !isOverlay(id)) ?? datasets[0]?.id;
 
   const custom = !BASEMAPS.some((b) => b.id === choice);
 
@@ -43,38 +64,66 @@ export default function MapControls() {
         aria-expanded={open}
         className="flex items-center justify-between rounded-md px-1 py-0.5 text-left text-neutral-300 hover:text-neutral-100"
       >
-        <span>Data sources ({on.length})</span>
+        <span>
+          Borders: {SOURCES.find((s) => s.id === current)?.label ?? "—"}
+        </span>
         <span className="text-xs text-neutral-500">{open ? "▲" : "▼"}</span>
       </button>
 
       {open && (
-        <ul className="flex flex-col gap-1.5 border-b border-neutral-800 pb-2">
-          {SOURCES.map((s) => (
-            <li key={s.id}>
-              <label className="flex cursor-pointer items-start gap-2">
-                <input
-                  type="checkbox"
-                  checked={on.includes(s.id)}
-                  onChange={() => toggle(s.id, s.restricted)}
-                  className="mt-1 accent-neutral-100"
-                />
-                <span>
-                  <span className="text-neutral-100">{s.label}</span>
-                  {s.restricted && (
-                    <span className="ml-1 rounded bg-amber-900/70 px-1 text-[10px] uppercase text-amber-200">
-                      NC
-                    </span>
-                  )}
-                  {s.note && (
-                    <span className="block text-xs leading-snug text-neutral-500">
-                      {s.note}
-                    </span>
-                  )}
-                </span>
-              </label>
-            </li>
-          ))}
-        </ul>
+        <div className="flex flex-col gap-2 border-b border-neutral-800 pb-2">
+          <ul className="flex flex-col gap-1.5">
+            {datasets.map((s) => (
+              <li key={s.id}>
+                <label className="flex cursor-pointer items-start gap-2">
+                  <input
+                    type="radio"
+                    name="border-source"
+                    checked={current === s.id}
+                    onChange={() => choose(s.id, s.restricted)}
+                    className="mt-1 accent-neutral-100"
+                  />
+                  <span>
+                    <span className="text-neutral-100">{s.label}</span>
+                    {s.restricted && (
+                      <span className="ml-1 rounded bg-amber-900/70 px-1 text-[10px] uppercase text-amber-200">
+                        NC
+                      </span>
+                    )}
+                    {s.note && (
+                      <span className="block text-xs leading-snug text-neutral-500">
+                        {s.note}
+                      </span>
+                    )}
+                  </span>
+                </label>
+              </li>
+            ))}
+          </ul>
+
+          <ul className="flex flex-col gap-1.5 border-t border-neutral-800 pt-2">
+            {overlays.map((s) => (
+              <li key={s.id}>
+                <label className="flex cursor-pointer items-start gap-2">
+                  <input
+                    type="checkbox"
+                    checked={on.includes(s.id)}
+                    onChange={() => toggleOverlay(s.id)}
+                    className="mt-1 accent-neutral-100"
+                  />
+                  <span>
+                    <span className="text-neutral-100">{s.label}</span>
+                    {s.note && (
+                      <span className="block text-xs leading-snug text-neutral-500">
+                        {s.note}
+                      </span>
+                    )}
+                  </span>
+                </label>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
 
       <div className="flex items-center gap-2">

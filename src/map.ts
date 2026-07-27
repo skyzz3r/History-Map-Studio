@@ -10,6 +10,7 @@ import {
 } from "./ohm.ts";
 import { flagFileFor, normFile, thumbUrls } from "./wikidata.ts";
 import {
+  BASEMAP_TILES,
   HATCH,
   SOURCES,
   dateFilter,
@@ -17,6 +18,7 @@ import {
   ohmIsLocal,
   ohmMinZoom,
   normaliseHB,
+  normaliseSources,
   saveSources,
   savedSources,
   type Source,
@@ -26,25 +28,26 @@ import { bboxArea, claimsFrom, overlappingIds, type Sample } from "./claims.ts";
 import { featureArea } from "./geo.ts";
 import {
   childIds,
+  coveredIds,
   focusFilter,
   initialFocus,
   mergeAllow,
   nextLevel,
   type FocusState,
+  type Level,
 } from "./focus.ts";
 
-// Source Cooperative's mirror of the Protomaps planet, NOT build.protomaps.com.
-// The build bucket only sends access-control-allow-origin for localhost origins, so
-// it works in dev and silently fails the moment the site is deployed. This mirror
-// sends `*`, and its URL is stable rather than dated. ~135GB, but range requests
-// mean we only ever pull the bytes for visible tiles.
-const BASEMAP =
-  "pmtiles://https://data.source.coop/protomaps/openstreetmap/v4.pmtiles";
+// ~135 GB, but range requests mean we only ever pull the bytes for visible tiles.
+const BASEMAP = BASEMAP_TILES;
 
 // The basemap is a backdrop for historical borders, so drop everything modern:
 // roads, buildings, POIs, and — critically — present-day country boundaries and
-// labels, which would contradict whatever era is on screen. The `today` source
-// re-enables the boundary half of this on demand.
+// labels, which would contradict whatever era is on screen.
+//
+// These are stripped UNCONDITIONALLY now. The `today` source used to work by
+// un-stripping them, which made it invisible (they are a dark hairline drawn to
+// sit under labels, and our fills cover them) and confined it to the Protomaps
+// basemaps. It draws its own cyan layers instead — see sources.ts.
 const CLUTTER =
   /^(roads|buildings|pois|address|landuse_(urban|hospital|industrial|school|aerodrome|runway|pier|zoo|pedestrian))/;
 const PRESENT_DAY = /^(boundaries|places_country|places_region)/;
@@ -64,6 +67,11 @@ let focus: FocusState = initialFocus();
 let onFocusChange: ((f: FocusState) => void) | null = null;
 /** osm_ids currently judged de-jure claims. Recomputed on the label pass. */
 let claims: unknown[] = [];
+/**
+ * Countries standing inside a level-1 empire or union at the world view, which
+ * that empire now draws in place of. Recomputed on the same debounced pass.
+ */
+let covered: number[] = [];
 
 export const getFocus = () => focus;
 export const bindFocusChange = (fn: (f: FocusState) => void) => {
@@ -122,16 +130,13 @@ function extraClause(layerId: string): any[] | null {
 function applyFilters() {
   if (!map) return;
   const date = dateFilter(currentDate);
-  const f = focusFilter(focus);
+  const f = focusFilter(focus, covered);
   for (const s of active()) {
+    // A cosmetic overlay carries no dates and no hierarchy; it keeps the filter
+    // its own attach() set, and filtering it here would blank it.
+    if (s.overlay) continue;
     for (const id of s.layers) {
       if (!map.getLayer(id)) continue;
-      // The present-day source has no dates and no hierarchy; it is a reference
-      // overlay, so filtering it would blank it.
-      if (s.id === "today") {
-        map.setFilter(id, null);
-        continue;
-      }
       map.setFilter(id, ["all", date, f, ...(extraClause(id) ?? [])] as never);
     }
   }
@@ -183,7 +188,7 @@ export type Basemap = { id: string; label: string; style: () => unknown };
 
 const baseLayers = (flavor: "dark" | "light") =>
   layers("protomaps", namedFlavor(flavor), { lang: "en" }).filter(
-    (l) => !CLUTTER.test(l.id) && !(PRESENT_DAY.test(l.id) && !enabled.includes("today")),
+    (l) => !CLUTTER.test(l.id) && !PRESENT_DAY.test(l.id),
   );
 
 const protomaps = (flavor: "dark" | "light"): StyleSpecification => ({
@@ -360,25 +365,39 @@ function addLabelLayer() {
   });
 }
 
-/** Enable/disable sources at runtime. Rebuilds the style when needed. */
+/**
+ * Switch the border dataset (and any cosmetic overlay) at runtime.
+ *
+ * No setStyle any more: `today` owns real layers now, so nothing here needs the
+ * whole style rebuilt, and a rebuild was itself a source of the "dataset does
+ * not load" reports — it tore every layer down and relied on the styledata
+ * listener to race them back.
+ */
 export async function setSources(ids: string[]) {
-  const hadToday = enabled.includes("today");
-  enabled = ids;
-  saveSources(ids);
+  enabled = normaliseSources(ids);
+  saveSources(enabled);
 
   for (const s of SOURCES) {
-    if (ids.includes(s.id)) continue;
+    if (enabled.includes(s.id)) continue;
     for (const l of s.layers) if (map.getLayer(l)) map.removeLayer(l);
+    // Drop the source too, so re-enabling rebuilds it from scratch instead of
+    // adopting a stale one. Layers must go first or MapLibre refuses.
+    if (SRC_ID[s.id] && map.getSource(SRC_ID[s.id])) map.removeSource(SRC_ID[s.id]);
   }
-  // The present-day source is basemap layers we normally strip, so toggling it
-  // means rebuilding the style rather than adding a layer.
-  if (hadToday !== ids.includes("today")) return setBasemap(savedBasemap());
 
   for (const s of SOURCES) {
-    if (!ids.includes(s.id)) continue;
-    if (s.layers.length && s.layers.some((l) => map.getLayer(l))) continue;
-    await s.attach(map, "hist-label");
+    if (!enabled.includes(s.id)) continue;
+    if (s.layers.length && s.layers.every((l) => map.getLayer(l))) continue;
+    await s.attach(map, map.getLayer("hist-label") ? "hist-label" : undefined);
   }
+
+  // Refill the datasets that hold their data in a GeoJSON source rather than
+  // fetching it themselves. THIS is why Historical-Basemaps came up blank when
+  // it was enabled after another dataset: attach() creates an empty source, and
+  // the snapshot only arrives on the next timeline move — so the map stayed
+  // empty until you happened to drag the slider.
+  if (coarse) setCoarse(coarse);
+
   applyFilters();
   queueLabels();
 }
@@ -432,6 +451,9 @@ export async function initMap(
   if (saved !== "dark") setBasemap(saved);
 
   new ResizeObserver(() => map.resize()).observe(container);
+  // Dev-only handle so the map can be driven and asserted against from a console
+  // or an automated browser session. Stripped from production by the guard.
+  if ((import.meta as any).env?.DEV) (window as any).__map = map;
   return map;
 }
 
@@ -449,6 +471,38 @@ const SRC_OF: Record<string, [string, string | undefined]> = {
   "hb-fill": ["hist-hb", undefined],
   "cs-fill": ["hist-cs", undefined],
 };
+
+/** Source id owned by each dataset, so disabling one can remove it cleanly. */
+const SRC_ID: Record<string, string> = {
+  ohm: "hist-ohm",
+  hb: "hist-hb",
+  cshapes: "hist-cs",
+  today: "hist-today",
+};
+
+/**
+ * The clicked polity, highlighted on the map.
+ *
+ * Previously nothing marked it at all: the side sheet opened and the map looked
+ * identical, so "which one did I just select" had no answer — and it read as the
+ * datasets behaving differently, since each had its own hover lift and none had
+ * a selected state. `selected` is one feature-state, and every source's paint
+ * reads it through the shared helpers in sources.ts.
+ */
+let picked: { layer: string; id: string | number } | null = null;
+
+function setSelected(hit: Hit | null) {
+  if (picked) {
+    const [src, sl] = SRC_OF[picked.layer] ?? [];
+    if (src) map.setFeatureState(stateRef(src, sl, picked.id), { selected: false });
+  }
+  picked = null;
+  if (!hit || hit.f.id === undefined) return;
+  const [src, sl] = SRC_OF[hit.layer] ?? [];
+  if (!src) return;
+  picked = { layer: hit.layer, id: hit.f.id };
+  map.setFeatureState(stateRef(src, sl, hit.f.id), { selected: true });
+}
 
 function bindHover() {
   let hot: { layer: string; id: string | number } | null = null;
@@ -572,9 +626,13 @@ function bindClick(onPick: (p: Picked | null, others: Picked[]) => void) {
     // The whole stack, not only the winner. Where two polities genuinely
     // overlap — a de-facto occupier and the de-jure claimant it displaced —
     // the loser was previously unreachable by any click at all.
-    const stack = hitsAt(e.point)
-      .filter((h) => h.f.properties)
-      .map((h) => toPicked(h.f.properties!));
+    const hits = hitsAt(e.point).filter((h) => h.f.properties);
+    setSelected(hits[0] ?? null);
+    const stack = hits.map((h) => toPicked(h.f.properties!));
+    // Clicking away from every polity is a deselect, and a deselect returns to
+    // the top of the hierarchy rather than stranding you inside a drill-down
+    // whose subject is no longer selected.
+    if (!stack.length && focus.trail.length) drillOut(0);
     onPick(stack[0] ?? null, stack.slice(1));
   });
 
@@ -680,6 +738,8 @@ export async function drillInto(p: Picked): Promise<boolean> {
       // screen and let you select regions outside the parent.
       maxLevel: level + 2,
       allow: [],
+      children: [],
+      resolved: false,
     };
     applyFilters();
     notify();
@@ -690,15 +750,17 @@ export async function drillInto(p: Picked): Promise<boolean> {
   return resolveChildren(p.osmId, level);
 }
 
-/** Pop back to `index` in the trail; -1 returns to the country view. */
+/** Pop back to `index` in the trail; 0 returns to the world view. */
 export function drillOut(index: number) {
   const trail = focus.trail.slice(0, Math.max(0, index));
   const last = trail[trail.length - 1];
   focus = {
     trail,
-    maxLevel: last ? last.adminLevel + 2 : 2,
+    maxLevel: last ? last.adminLevel + 2 : initialFocus().maxLevel,
     // Same rule as drillInto: an open maxLevel always carries a restriction.
     allow: last ? [] : null,
+    children: [],
+    resolved: !last,
   };
   applyFilters();
   queueLabels();
@@ -711,6 +773,18 @@ export function drillOut(index: number) {
 }
 
 /**
+ * Back to the world view and clear the selection highlight.
+ *
+ * Deselecting has to land here rather than one level up: the trail's whole
+ * purpose is to describe the selected territory, so with nothing selected there
+ * is no trail to be partway along.
+ */
+export function resetFocus() {
+  setSelected(null);
+  if (focus.trail.length) drillOut(0);
+}
+
+/**
  * Wait for the new view, then narrow the focus to the subdivisions that are
  * genuinely inside the parent. Returns whether any were found — the side sheet
  * uses that to disable its button instead of appearing to do nothing.
@@ -719,7 +793,13 @@ async function resolveChildren(osmId: number, level: number): Promise<boolean> {
   await whenIdle();
   const r = childrenOf(osmId, level);
   if (!r) return false;
-  focus = { ...focus, maxLevel: r.level, allow: r.ids };
+  focus = {
+    ...focus,
+    maxLevel: r.level,
+    allow: r.ids,
+    children: r.nodes.filter((n) => n.adminLevel === r.level),
+    resolved: true,
+  };
   applyFilters();
   queueLabels();
   notify();
@@ -738,17 +818,24 @@ async function resolveChildren(osmId: number, level: number): Promise<boolean> {
 function childrenOf(
   osmId: number,
   level: number,
-): { ids: number[]; level: number } | null {
+): { ids: number[]; level: number; nodes: Level[] } | null {
+  const feats = sourceFeatures();
+  if (!feats) return null;
+  const { ids, counts, nodes } = childIds(feats, osmId, level);
+  return { ids, level: nextLevel(level, counts), nodes };
+}
+
+/** Every feature of the active dataset alive at the current date, unfiltered by
+ *  the focus — the set both child discovery and empire containment read. */
+function sourceFeatures(): maplibregl.GeoJSONFeature[] | null {
   const s = pickable()[0];
   if (!s) return null;
   const [srcId, sourceLayer] = SRC_OF[s.pickLayer] ?? [];
   if (!srcId || !map.getSource(srcId)) return null;
-  const feats = map.querySourceFeatures(srcId, {
+  return map.querySourceFeatures(srcId, {
     sourceLayer,
     filter: dateFilter(currentDate),
   });
-  const { ids, counts } = childIds(feats, osmId, level);
-  return { ids, level: nextLevel(level, counts) };
 }
 
 // ---------------------------------------------------------------------------
@@ -840,11 +927,34 @@ async function refreshOverlaps() {
     const merged = r ? mergeAllow(focus.allow, r.ids) : focus.allow;
     const level = Math.max(focus.maxLevel, r?.level ?? 0);
     if (merged.length !== focus.allow.length || level !== focus.maxLevel) {
-      focus = { ...focus, allow: merged, maxLevel: level };
+      focus = {
+        ...focus,
+        allow: merged,
+        maxLevel: level,
+        children: r ? r.nodes.filter((n) => n.adminLevel === level) : focus.children,
+        resolved: true,
+      };
       widened = true;
+      notify();
     }
   }
-  if (changed || widened) applyFilters();
+
+  // At the world view, work out which countries an empire or union is standing
+  // in for. Only there: drilling into the British Empire must bring its members
+  // back, and the cost is a point-in-polygon per country per pass.
+  let recovered = false;
+  if (!focus.trail.length) {
+    const next = coveredIds(sourceFeatures() ?? []);
+    if (next.length !== covered.length || next.some((v, i) => v !== covered[i])) {
+      covered = next;
+      recovered = true;
+    }
+  } else if (covered.length) {
+    covered = [];
+    recovered = true;
+  }
+
+  if (changed || widened || recovered) applyFilters();
 }
 
 /** True when nothing is queued — the video renderer waits on this. */

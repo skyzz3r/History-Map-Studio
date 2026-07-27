@@ -217,6 +217,15 @@ export function transform(f) {
     if (!props.admin_level) props.admin_level = 2;
   }
 
+  // Maritime limit lines are not polities. OHM traces `12nm line - Turkey`,
+  // `3.2nm line - Russia`, `6nm line - Greece` and hundreds more as tagged WAYS
+  // carrying maritime=yes and type=boundary but NO admin_level and, in 39 of 40
+  // sampled, no boundary tag either. osmium pulls them in as members of the
+  // boundary relations we do want, and a missing admin_level coerced to 0, which
+  // passed every "<= maxLevel" test — so they drew across the oceans and took
+  // labels with them. Dropping them here also shrinks the archive.
+  if (!props.admin_level || props.maritime === "yes") return [];
+
   const osmId = osmIdOf(f);
   if (osmId !== null) props.osm_id = osmId;
 
