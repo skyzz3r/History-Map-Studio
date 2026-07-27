@@ -163,23 +163,37 @@ export function coveredIds(
 ): number[] {
   const roots: any[] = [];
   const rootIds = new Set<string>();
+  // Geometry per root, so an assigned child can be tested against ITS OWN empire
+  // rather than any empire on screen.
+  const rootGeom = new Map<string, any[]>();
   for (const f of feats)
     if (Number(f.properties?.admin_level) === ROOT_LEVEL && f.geometry) {
       roots.push(f.geometry);
-      rootIds.add(String(f.properties?.osm_id));
+      const rid = String(f.properties?.osm_id);
+      rootIds.add(rid);
+      (rootGeom.get(rid) ?? rootGeom.set(rid, []).get(rid)!).push(f.geometry);
     }
   if (!roots.length) return [];
 
   const out = new Set<number>();
   for (const f of feats) {
     if (Number(f.properties?.admin_level) !== COUNTRY_LEVEL) continue;
-    // An explicit parent settles it both ways: assigned to an empire means
-    // covered, assigned anywhere else means the empire does not stand in for it
-    // however the polygons happen to overlap.
+    // An explicit parent settles WHICH empire, but not whether that empire
+    // visually stands in for the child. Covering means "the empire's fill
+    // already paints this ground, so hide the child underneath it." That only
+    // holds where the empire polygon actually reaches the child: São Tomé and
+    // mainland Portugal sit inside the Portuguese Empire, so they hide and the
+    // empire shows through. A detached colony like the State of Brazil sits
+    // OUTSIDE it — hiding that one paints nothing back, so it must stay drawn.
+    // (Assigning it here was the reported "it wiped the region off".)
     const assigned = parents?.get(String(f.properties?.osm_id));
     if (assigned !== undefined) {
+      if (!rootIds.has(assigned)) continue; // assigned below empire level: never covered
+      const c = centreOf(f.geometry);
+      const gs = rootGeom.get(assigned) ?? [];
       const id0 = Number(f.properties?.osm_id);
-      if (rootIds.has(assigned) && Number.isFinite(id0)) out.add(id0);
+      if (c && gs.some((g) => insideGeometry(c, g)) && Number.isFinite(id0))
+        out.add(id0);
       continue;
     }
     const c = centreOf(f.geometry);

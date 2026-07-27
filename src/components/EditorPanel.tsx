@@ -85,10 +85,27 @@ export default function EditorPanel({
 
   const save = () => {
     if (!picked) return;
-    const ok = saveEdit(picked.osmId, {
-      ...form,
-      parent: parent.id === undefined || parent.id === "" ? undefined : parent.id,
-    });
+    // Whether any VISIBLE field changed decides everything. If one did, send the
+    // full display snapshot so the amber overlay copy renders complete (name AND
+    // both dates AND level), not just the one field that changed. If none did, a
+    // parent pick reaches the store as a parent-only patch — so the region stays
+    // its native self on the map (part of its empire) instead of turning amber.
+    const orig: Partial<EditProps> = {
+      name: picked.name,
+      admin_level: picked.adminLevel,
+      start_date: picked.startDate,
+      end_date: picked.endDate,
+    };
+    const keys = ["name", "admin_level", "start_date", "end_date"] as const;
+    const displayChanged = keys.some(
+      (k) => form[k] !== undefined && form[k] !== orig[k],
+    );
+    const parentId =
+      parent.id === undefined || parent.id === "" ? undefined : parent.id;
+    const patch: Partial<EditProps> = displayChanged
+      ? { ...orig, ...form, parent: parentId }
+      : { parent: parentId };
+    const ok = saveEdit(picked.osmId, patch);
     // Geometry is snapshotted from the loaded tiles, so an edit made with the
     // region off screen has nothing to redraw. Say so instead of appearing to
     // save and changing nothing.

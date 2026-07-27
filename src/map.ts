@@ -42,6 +42,7 @@ import {
 } from "./focus.ts";
 import {
   addFeature,
+  changesDisplay,
   editFeatures,
   excludedIds,
   loadEdits,
@@ -754,6 +755,17 @@ function hitsAt(point: maplibregl.PointLike): Hit[] {
   const ancestors = new Set(focus.trail.map((t) => String(t.osmId)));
   const isClaim = new Set(claims.map(String));
 
+  // At the world view, a region the user assigned to an empire is not clickable
+  // on its own — clicking it should reach the empire, not the member. That is
+  // the "not instantly clickable unless the empire is clicked" rule: the member
+  // stays drawn and highlights with its empire, but you select it only after
+  // drilling in, where the trail is no longer empty and this set is skipped.
+  const grouped =
+    !editMode && !focus.trail.length
+      ? new Set(parentOverrides(currentSourceId()).keys())
+      : null;
+  const ungrouped = (id: string) => !grouped?.has(id);
+
   // Edits win the click. They are drawn over the dataset and are what the user
   // most recently asserted is true, so a corrected region must be the thing you
   // select and re-edit rather than the original showing through.
@@ -764,7 +776,7 @@ function hitsAt(point: maplibregl.PointLike): Hit[] {
       const seen = new Map<string, Hit>();
       for (const f of raw) {
         const id = String(f.properties?.osm_id ?? "");
-        if (!seen.has(id) && s)
+        if (!seen.has(id) && ungrouped(id) && s)
           seen.set(id, { layer: "edit-fill", source: s, f });
       }
       if (seen.size) return [...seen.values()];
@@ -798,6 +810,11 @@ function hitsAt(point: maplibregl.PointLike): Hit[] {
     // a country with no mapped subdivisions would make it unclickable.
     const withoutAncestors = list.filter(([id]) => !ancestors.has(id));
     if (withoutAncestors.length) list = withoutAncestors;
+    // Empire members are not clickable on their own at the world view. Dropped
+    // unconditionally: unlike ancestors, a member that swallows the click is
+    // never the thing you meant to select there — the empire beneath or beside
+    // it is.
+    list = list.filter(([id]) => ungrouped(id));
 
     list.sort(
       ([, a], [, b]) =>
@@ -1393,6 +1410,12 @@ export function saveEdit(
   props: Partial<EditProps>,
 ): boolean {
   const src = currentSourceId();
+  // A parent-only edit leaves the original polygon on screen, so there is
+  // nothing to snapshot and nothing to warn about — it always applies.
+  if (!changesDisplay(props)) {
+    setOverride(src, osmId, props);
+    return true;
+  }
   const geom = geometryOf(osmId);
   setOverride(src, osmId, props, geom ?? undefined);
   // An added region carries its own geometry and never needs a snapshot.

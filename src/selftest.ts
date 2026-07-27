@@ -31,10 +31,10 @@ import {
   normaliseCShapes,
   normaliseHB,
   normaliseSources,
-  NO_START,
   OCEAN_KINDS,
 } from "./sources.ts";
 import {
+  changesDisplay,
   excludedIdsOf,
   importEdits,
   sanitise,
@@ -693,9 +693,12 @@ assert.equal(yearNum("garbage", 42), 42, "unparseable falls back, never NaN");
 {
   // The numeric pair is what dateFilter compares, so an edit that sets only the
   // string would show the new date and change nothing on the map.
-  const p = withDates({ osm_id: 1, end_date: "1806-08-06" });
+  const p = withDates({ osm_id: 1, start_date: "1500", end_date: "1806-08-06" });
   assert.equal(Math.floor(p.end_num!), 1806, "end_date must drive end_num");
-  assert.equal(p.start_num, NO_START, "absent start stays open-ended");
+  assert.equal(Math.floor(p.start_num!), 1500, "start_date must drive start_num");
+  // A field the patch never mentions is not fabricated — the date filter's own
+  // coalesce fallback supplies the open-ended sentinel instead.
+  assert.equal("start_num" in withDates({ osm_id: 1, end_date: "1806" }), false);
 }
 {
   // A file that parses but is not an edits document must be refused, not
@@ -770,15 +773,46 @@ assert.equal(closeRing([[0, 0], [1, 1]] as any), null, "two points is not an are
     { properties: { osm_id: -1, admin_level: 1, name: "Union" }, geometry: sq(0, 0, 10) },
     // Inside the union geometrically, but assigned elsewhere by the user.
     { properties: { osm_id: 2, admin_level: 2, name: "Not a member" }, geometry: sq(1, 1, 2) },
-    // Outside it, but the user says it belongs.
-    { properties: { osm_id: 3, admin_level: 2, name: "Member" }, geometry: sq(50, 50, 2) },
+    // Outside it, but the user says it belongs — a detached colony.
+    { properties: { osm_id: 3, admin_level: 2, name: "Colony" }, geometry: sq(50, 50, 2) },
+    // Inside AND assigned to it — a metropole the empire's fill covers.
+    { properties: { osm_id: 4, admin_level: 2, name: "Metropole" }, geometry: sq(6, 6, 2) },
   ];
-  const parents = new Map([["2", "-999"], ["3", "-1"]]);
+  const parents = new Map([["2", "-999"], ["3", "-1"], ["4", "-1"]]);
   const r = childIds(feats, -1, 1, parents);
-  assert.deepEqual(r.ids.sort(), [3], "explicit parent wins over containment, both ways");
+  assert.deepEqual(r.ids.sort(), [3, 4], "explicit parent wins over containment, both ways");
   const cov = coveredIds(feats, parents);
   assert.ok(!cov.includes(2), "a country assigned away is not covered by the union");
-  assert.ok(cov.includes(3), "a country assigned in IS covered, though outside");
+  // Covering hides the child under the empire's fill. A detached colony has no
+  // fill over it, so hiding it paints nothing back — the reported wipe. It must
+  // stay drawn; only a child the empire actually covers is hidden.
+  assert.ok(!cov.includes(3), "an assigned colony OUTSIDE the empire is not hidden");
+  assert.ok(cov.includes(4), "an assigned member the empire's fill covers is hidden");
+}
+
+// --- a parent assignment is metadata, not a visible edit -------------------
+{
+  // Assigning a parent regroups the hierarchy but changes nothing on screen, so
+  // it must NOT promote the region to an amber edit copy: the original OHM
+  // polygon has to keep rendering (which is what makes it read as part of its
+  // empire). Only a display change — name, dates, level — promotes.
+  assert.equal(changesDisplay({ parent: -1 }), false, "parent alone is not a display change");
+  assert.equal(changesDisplay({ name: "X" }), true, "a rename is");
+  assert.equal(changesDisplay({ start_date: "1500" }), true, "a date is");
+  const doc = sanitise({
+    ohm: {
+      overrides: {
+        "-10": { props: { parent: -1 }, geometry: { type: "Polygon", coordinates: [] } },
+        "-11": { props: { name: "Renamed", parent: -1 }, geometry: { type: "Polygon", coordinates: [] } },
+      },
+      added: [],
+    },
+  });
+  const ex = excludedIdsOf(doc, "ohm");
+  assert.ok(!ex.includes(-10), "parent-only edit leaves the original visible");
+  assert.ok(ex.includes(-11), "a rename still hides the original for its amber copy");
+  // withDates must not fabricate date numbers for a parent-only patch.
+  assert.equal("start_num" in withDates({ osm_id: 1, parent: -1 }), false, "no date, no start_num");
 }
 
 // --- childIds hands the diagram real names ---------------------------------

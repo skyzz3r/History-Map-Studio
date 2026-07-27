@@ -227,10 +227,32 @@ export const countEdits = (src: string) => {
  */
 export function withDates(p: EditProps): EditProps {
   const out = { ...p };
-  out.start_num = yearNum(out.start_date, NO_START);
-  out.end_num = yearNum(out.end_date, NO_END);
+  // Only when the edit actually touches a date. A parent-only patch must stay a
+  // parent-only patch: injecting start_num/end_num would make it look like a
+  // display edit (see PROMOTE below) and promote a region that never changed.
+  if ("start_date" in out) out.start_num = yearNum(out.start_date, NO_START);
+  if ("end_date" in out) out.end_num = yearNum(out.end_date, NO_END);
   return out;
 }
+
+/**
+ * Fields whose edit is VISIBLE and so needs the promote dance (hide the
+ * original, draw an amber copy). `parent` is deliberately not among them: it
+ * regroups a region in the hierarchy without changing how it looks, so a
+ * parent-only edit leaves the original OHM polygon on screen exactly as it was —
+ * which is what makes an assigned colony read as part of its empire (like New
+ * Spain) instead of turning amber or, worse, vanishing.
+ */
+const DISPLAY_KEYS = [
+  "name",
+  "admin_level",
+  "start_date",
+  "end_date",
+  "start_num",
+  "end_num",
+];
+export const changesDisplay = (props?: Partial<EditProps>): boolean =>
+  !!props && DISPLAY_KEYS.some((k) => k in props);
 
 /** "1815-06-18" -> 1815.46. Absent or unparseable falls back to the sentinel. */
 export function yearNum(date: string | undefined, fallback: number): number {
@@ -264,11 +286,12 @@ export function excludedIdsOf(doc: EditsDoc, src: string): (string | number)[] {
   if (!b) return [];
   const out: (string | number)[] = [];
   for (const [id, o] of Object.entries(b.overrides)) {
-    // A property edit hides the original ONLY when there is a replacement to
-    // draw. Without the geometry snapshot the feature would be excluded here
-    // and absent from the overlay — the region would simply vanish, which is
-    // the worst possible outcome of pressing Save.
-    if (!o.deleted && !(o.props && o.geometry)) continue;
+    // A property edit hides the original ONLY when there is a VISIBLE change and
+    // a replacement to draw. Without the geometry snapshot the feature would be
+    // excluded here and absent from the overlay — it would simply vanish. And a
+    // parent-only edit changes nothing visible, so the original must keep
+    // rendering rather than being swapped for an identical amber copy.
+    if (!o.deleted && !(changesDisplay(o.props) && o.geometry)) continue;
     // Tile ids are numbers; a string would never match ["in", ["get","osm_id"]].
     const n = Number(id);
     out.push(Number.isFinite(n) && id.trim() !== "" ? n : id);
@@ -293,7 +316,7 @@ export function editFeatures(src: string): {
   const features: EditFeature[] = [];
   for (const f of b?.added ?? []) features.push(f);
   for (const [id, o] of Object.entries(b?.overrides ?? {})) {
-    if (o.deleted || !o.props || !o.geometry) continue;
+    if (o.deleted || !changesDisplay(o.props) || !o.geometry) continue;
     const n = Number(id);
     features.push({
       type: "Feature",
