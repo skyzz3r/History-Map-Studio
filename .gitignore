@@ -3,3 +3,6 @@ dist/
 .impeccable/
 *.local
 .DS_Store
+
+# Off-Pages tile archives staged for R2 upload (too big for git)
+world-historical-z*.pmtiles

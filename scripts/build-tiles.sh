@@ -73,7 +73,7 @@ if [ ! -f "$WORK/planet.osm.pbf" ]; then
   say "fetching $KEY"
   # Silent: the progress bar emitted 200 lines of hashes into the CI log and
   # buried the only messages worth reading.
-  curl -sS --retry 3 -o "$WORK/planet.osm.pbf" "$BUCKET/$KEY"
+  curl -sS -C - --retry 8 --retry-all-errors -o "$WORK/planet.osm.pbf" "$BUCKET/$KEY"
   say "downloaded $(du -m "$WORK/planet.osm.pbf" | cut -f1) MB"
 fi
 
@@ -113,8 +113,12 @@ if [ ! -f "$WORK/prepared.geojsonseq" ]; then
   say "filtered $(du -m "$WORK/bounds.osm.pbf" | cut -f1) MB"
 
   say "export + prepare"
+  # PREPARE_CMD lets a local run swap in a pre-bundled prepare (plain JS) when
+  # the node at hand was built without --experimental-strip-types. CI keeps the
+  # default, which strips the .ts import from prepare.mjs on the fly.
+  PREPARE_CMD="${PREPARE_CMD:-node --experimental-strip-types scripts/prepare.mjs}"
   osmium export "$WORK/bounds.osm.pbf" -f geojsonseq --attributes=id,type \
-    | node --experimental-strip-types scripts/prepare.mjs \
+    | $PREPARE_CMD \
     > "$WORK/prepared.geojsonseq"
 fi
 PREPARED_LINES=$(wc -l < "$WORK/prepared.geojsonseq")
@@ -152,22 +156,22 @@ fi
 # "preparedgeojsonseq"` — so without this, anything missing a directive lands in
 # a layer named after the input file, which no style references.
 FINAL_Z=""
-for Z in 10 8 6; do
+# ZOOMS lets a local run skip rungs already measured (e.g. z10 is a known 837 MB
+# and never fits GitHub Pages). CI keeps the full ladder.
+for Z in ${ZOOMS:-10 8 7 6}; do
   say "tippecanoe -z$Z"
-  # These flags are the ones that MEASURABLY produced a working tileset (77 MB,
-  # z0-6, 52,845 boundaries in the z0 tile). Two attempts to improve on them
-  # both failed, and both are recorded here so they are not retried blind:
+  # These flags MEASURABLY keep the z0 world tile full: a LOCAL sweep on the real
+  # planet extract (122,140 features) gave z0=52,817 at maxzoom 10 with exactly
+  # these flags. The earlier "raising maxzoom empties z0 to two features" was
+  # never the maxzoom — it was the per-feature minzoom-by-admin_level gating
+  # (since reverted in prepare.mjs), which is why the ladder is safe to climb.
   #
-  #   * per-feature minzoom by admin_level let the build reach z10, and the z0
-  #     tile came out holding TWO features. Something in tippecanoe's low-zoom
-  #     reduction scales with the distance below maxzoom.
-  #   * -r1, to stop that reduction, made tippecanoe keep every feature at
-  #     every zoom; it died during "Reordering geometry" at 25%.
-  #
-  # Diagnosing which of tippecanoe's several reduction mechanisms is
-  # responsible needs a local tippecanoe to experiment against. Until then this
-  # stays on the known-good setting rather than costing another 20-minute run
-  # per guess.
+  # The real ceiling is SIZE, not zoom: at maxzoom 10 the archive is ~837 MB,
+  # far over the GitHub Pages 100 MB cap. The ladder therefore drops one zoom at
+  # a time and takes the highest maxzoom whose archive fits LIMIT_MB. z0 stays
+  # full at every rung (--no-tile-size-limit means --drop-densest-as-needed
+  # never fires, so no feature is dropped). More high-zoom detail than the
+  # fitting rung allows needs off-GitHub hosting (Cloudflare R2), not a flag.
   tippecanoe -o "$OUT" --force -P -Z0 -z"$Z" -l boundaries \
     --drop-densest-as-needed --no-tile-size-limit \
     "$WORK/prepared.geojsonseq"

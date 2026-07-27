@@ -47,7 +47,13 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      # VITE_OHM_R2_URL points the app at an off-Pages PMTiles archive (higher
+      # maxzoom than the 100 MB Pages cap allows). Set repo variable OHM_R2_URL
+      # to enable it; empty = the app uses the bundled z6 file, then hosted
+      # tiles. See docs/R2-SETUP.md.
       - run: npm run build # tsc --noEmit && vite build
+        env:
+          VITE_OHM_R2_URL: ${{ vars.OHM_R2_URL }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

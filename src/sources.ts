@@ -60,6 +60,13 @@ const OHM_HOSTED = "https://vtiles.openhistoricalmap.org/boundaries/{z}/{x}/{y}"
 // imports this module in plain node.
 const BASE = (import.meta as any).env?.BASE_URL ?? "/";
 const OHM_LOCAL = `${BASE}basemaps/world-historical.pmtiles`;
+// Off-Pages PMTiles archive (Cloudflare R2 or similar). R2 has no 100 MB
+// per-file cap, so it can hold a higher-maxzoom build than public/basemaps.
+// Set VITE_OHM_R2_URL at build time to the object's public URL; empty = unused,
+// and detectOhm falls back to the local file, then to the gated hosted tiles.
+// The bucket must send CORS (Access-Control-Allow-Origin for the site) and
+// honour Range requests — see docs/R2-SETUP.md.
+const OHM_R2 = ((import.meta as any).env?.VITE_OHM_R2_URL ?? "").trim();
 
 /**
  * Hosted tiles are gated to zoom 5+ because they ship ~300 name_* fields per
@@ -76,43 +83,50 @@ export type OhmTiles = {
  * KILL SWITCH for the self-hosted archive. Set false while the published
  * tileset is not trustworthy.
  *
- * Currently FALSE. The tileset on the `tiles` branch is the one from build #6,
- * whose z0 tile contains two features — a maritime line and a town in Alaska —
- * because tippecanoe's low-zoom reduction scales with distance below maxzoom
- * and that build reached z10. Pushing an unrelated fix to main redeployed
- * Pages, which checks the `tiles` branch out at build time, so the broken
- * archive went live.
+ * TRUE. A local pipeline run (osmium + tippecanoe on the 2026-07-27 planet)
+ * produced world-historical.pmtiles: maxzoom 6, 80 MB, and the z0 world tile
+ * carries 52,876 boundaries — verified by decoding it, not by trusting a size.
+ * That removes the zoom-5 gate (detectOhm reports minzoom 0 for the local set).
  *
- * The hosted OHM tiles are gated to zoom 5 but they are CORRECT, which beats a
- * blank world map. Flip back to true once a build passes the z0 feature check
- * in scripts/build-tiles.sh.
+ * maxzoom stops at 6 because higher rungs overflow the GitHub Pages 100 MB cap,
+ * not because they empty low zooms (they do not — z10 also carried ~52,800 at
+ * z0). Measured: z10=837, z8=209, z7=124, z6=80 MB. More high-zoom detail than
+ * z6 gives needs off-Pages hosting (Cloudflare R2), not a pipeline change.
+ *
+ * The file lives in public/basemaps/ for local dev and on the orphan `tiles`
+ * branch for production; deploy.yml checks that branch out at build time.
  */
-const USE_LOCAL_TILES = false;
+const USE_LOCAL_TILES = true;
 
 let ohmTiles: OhmTiles | null = null;
 
 /** Detected once. Lets the app work before the CI tile build has ever run. */
 export async function detectOhm(): Promise<OhmTiles> {
   if (ohmTiles) return ohmTiles;
-  if (!USE_LOCAL_TILES) {
-    ohmTiles = { local: false, minzoom: 5, spec: { tiles: [OHM_HOSTED] } };
-    return ohmTiles;
-  }
-  try {
-    const r = await fetch(OHM_LOCAL, { method: "HEAD" });
-    // A missing file on GitHub Pages returns the 404 page as 200 text/html, so
-    // trust the content type, not the status.
-    const ok = r.ok && !(r.headers.get("content-type") ?? "").includes("text/html");
-    if (ok) {
-      ohmTiles = {
-        local: true,
-        minzoom: 0,
-        spec: { url: `pmtiles://${new URL(OHM_LOCAL, location.href).href}` },
-      };
-      return ohmTiles;
+  if (USE_LOCAL_TILES) {
+    // Prefer the off-Pages archive (higher maxzoom) when configured, then the
+    // bundled file. Each is probed so a bad URL or blocked CORS quietly falls
+    // through to the next candidate instead of blanking the map.
+    for (const url of [OHM_R2, OHM_LOCAL]) {
+      if (!url) continue;
+      try {
+        const r = await fetch(url, { method: "HEAD" });
+        // A missing file on GitHub Pages returns the 404 page as 200 text/html,
+        // so trust the content type, not the status.
+        const ok =
+          r.ok && !(r.headers.get("content-type") ?? "").includes("text/html");
+        if (ok) {
+          ohmTiles = {
+            local: true,
+            minzoom: 0,
+            spec: { url: `pmtiles://${new URL(url, location.href).href}` },
+          };
+          return ohmTiles;
+        }
+      } catch {
+        // offline, missing, or CORS-blocked — try the next candidate
+      }
     }
-  } catch {
-    // offline or blocked — fall through to the hosted tiles
   }
   ohmTiles = { local: false, minzoom: 5, spec: { tiles: [OHM_HOSTED] } };
   return ohmTiles;
