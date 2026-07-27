@@ -7,6 +7,7 @@ import {
   getFocus,
   initMap,
   resetFocus,
+  setEditMode,
   type Picked,
 } from "./map.ts";
 import { applyIndex, getIndex } from "./scrub.ts";
@@ -19,6 +20,7 @@ import SideSheet from "./components/SideSheet.tsx";
 import StudioBar from "./components/StudioBar.tsx";
 import MapControls from "./components/MapControls.tsx";
 import HierarchyPanel from "./components/HierarchyPanel.tsx";
+import EditorPanel from "./components/EditorPanel.tsx";
 
 export default function App() {
   const container = useRef<HTMLDivElement>(null);
@@ -32,6 +34,10 @@ export default function App() {
   const [keys, setKeys] = useState<Key[]>([]);
   const [focus, setFocus] = useState<FocusState>(initialFocus);
   const [tree, setTree] = useState(true);
+  const [editor, setEditor] = useState(false);
+  /** What the editor is editing. Separate from `picked`, which drives the side
+   *  sheet — in edit mode a click means "edit this", not "tell me about this". */
+  const [editing, setEditing] = useState<Picked | null>(null);
 
   /** Clearing the selection returns to the top of the hierarchy. */
   const deselect = () => {
@@ -64,6 +70,18 @@ export default function App() {
     };
   }, []);
 
+  // Edit mode reroutes clicks in map.ts: they select a region for editing
+  // instead of opening the side sheet. Leaving it clears both, so an old
+  // selection cannot be silently saved against.
+  useEffect(() => {
+    setEditMode(editor, setEditing);
+    if (!editor) setEditing(null);
+    else {
+      setPicked(null);
+      setOthers([]);
+    }
+  }, [editor]);
+
   // Entity lookup is keyed to the polygon AND the year on screen when it was
   // clicked. The clicked OHM feature has a `wikidata` tag ~90% of the time, so
   // ask Overpass for it and resolve the exact Q-id; searching by name is only
@@ -81,10 +99,14 @@ export default function App() {
       let title = picked.wikipedia?.startsWith("en:")
         ? picked.wikipedia.slice(3)
         : undefined;
-      if (!qid && picked.osmId) {
-        await fetchTags([picked.osmId]);
+      // Only real OSM ids reach Overpass. A drawn region ("edit-ohm-1") or a
+      // Historical-Basemaps feature ("hb-3") has nothing to look up, and asking
+      // with NaN returned a confusing empty result rather than skipping.
+      const nid = Number(picked.osmId);
+      if (!qid && Number.isFinite(nid) && nid) {
+        await fetchTags([nid]);
         if (stale) return;
-        const tags = cachedTags(picked.osmId);
+        const tags = cachedTags(nid);
         qid = qidOf(tags);
         title = enTitleOf(tags);
       }
@@ -112,6 +134,17 @@ export default function App() {
           className="pointer-events-auto rounded-lg bg-neutral-900/80 px-3 py-1.5 text-sm backdrop-blur hover:bg-neutral-800"
         >
           {studio ? "Exploration" : "Studio"}
+        </button>
+        <button
+          onClick={() => setEditor((e) => !e)}
+          aria-pressed={editor}
+          className={`pointer-events-auto rounded-lg px-3 py-1.5 text-sm backdrop-blur ${
+            editor
+              ? "bg-amber-500 font-medium text-neutral-900"
+              : "bg-neutral-900/80 hover:bg-neutral-800"
+          }`}
+        >
+          {editor ? "Editing" : "Edit borders"}
         </button>
         {error && (
           <span className="pointer-events-auto rounded-lg bg-red-950/90 px-3 py-1.5 text-sm text-red-200">
@@ -151,11 +184,17 @@ export default function App() {
         </div>
       )}
 
+      {editor && (
+        <div className="absolute right-4 top-20 z-10">
+          <EditorPanel picked={editing} onClose={() => setEditor(false)} />
+        </div>
+      )}
+
       {studio && <StudioBar keys={keys} setKeys={setKeys} max={count - 1} />}
 
       <Timeline max={count - 1} />
 
-      {picked && (
+      {picked && !editor && (
         <SideSheet
           picked={picked}
           info={info}

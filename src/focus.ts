@@ -12,7 +12,8 @@
 
 import { insideGeometry, labelPoint } from "./geo.ts";
 
-export type Level = { osmId: number; name: string; adminLevel: number };
+/** `osmId` is not always numeric — see Picked.osmId in map.ts. */
+export type Level = { osmId: number | string; name: string; adminLevel: number };
 
 /**
  * The top of the hierarchy: supranational unions and colonial empires.
@@ -44,7 +45,7 @@ export type FocusState = {
   /** Deepest admin_level currently drawn. */
   maxLevel: number;
   /** osm_ids allowed below the tip's level, or null for "no restriction". */
-  allow: number[] | null;
+  allow: (number | string)[] | null;
   /** Subdivisions of the tip, for the hierarchy diagram. Presentational only. */
   children: Level[];
   /**
@@ -114,7 +115,10 @@ export const tipLevel = (f: FocusState): number =>
  * ONLY at the world view — drilling into the British Empire has to reveal
  * exactly those members again.
  */
-export function focusFilter(f: FocusState, covered: number[] = []): any {
+export function focusFilter(
+  f: FocusState,
+  covered: (number | string)[] = [],
+): any {
   const al: any = ["coalesce", ["get", "admin_level"], 0];
   // A real polity, not a maritime limit line. See MIN_REAL_LEVEL.
   const clauses: any[] = [
@@ -154,16 +158,30 @@ export function focusFilter(f: FocusState, covered: number[] = []): any {
  */
 export function coveredIds(
   feats: { properties?: any; geometry?: any }[],
+  /** child -> parent from user edits; see childIds. */
+  parents?: Map<string, string>,
 ): number[] {
   const roots: any[] = [];
+  const rootIds = new Set<string>();
   for (const f of feats)
-    if (Number(f.properties?.admin_level) === ROOT_LEVEL && f.geometry)
+    if (Number(f.properties?.admin_level) === ROOT_LEVEL && f.geometry) {
       roots.push(f.geometry);
+      rootIds.add(String(f.properties?.osm_id));
+    }
   if (!roots.length) return [];
 
   const out = new Set<number>();
   for (const f of feats) {
     if (Number(f.properties?.admin_level) !== COUNTRY_LEVEL) continue;
+    // An explicit parent settles it both ways: assigned to an empire means
+    // covered, assigned anywhere else means the empire does not stand in for it
+    // however the polygons happen to overlap.
+    const assigned = parents?.get(String(f.properties?.osm_id));
+    if (assigned !== undefined) {
+      const id0 = Number(f.properties?.osm_id);
+      if (rootIds.has(assigned) && Number.isFinite(id0)) out.add(id0);
+      continue;
+    }
     const c = centreOf(f.geometry);
     // insideGeometry, NOT inside(outerRings): a union's polygon has HOLES where
     // non-members sit. Measured on live tiles, the outer-ring test reported
@@ -189,7 +207,10 @@ export function coveredIds(
  * its provinces were excluded forever. Merging each pass fixes that without ever
  * widening past the parent, since every pass still tests containment.
  */
-export const mergeAllow = (prev: number[] | null, found: number[]): number[] =>
+export const mergeAllow = (
+  prev: (number | string)[] | null,
+  found: (number | string)[],
+): (number | string)[] =>
   prev ? [...new Set([...prev, ...found])] : [...new Set(found)];
 
 export type Bounds = {
@@ -234,20 +255,37 @@ export const inBounds = (pt: [number, number], b: Bounds) =>
  */
 export function childIds(
   feats: { properties?: any; geometry?: any }[],
-  parentId: number,
+  parentId: number | string,
   level: number,
-): { ids: number[]; counts: Map<number, number>; nodes: Level[] } {
+  /**
+   * child osm_id -> parent osm_id, from user edits. An explicit parent BEATS
+   * geometry: the map cannot tell that Andorra is not in the European Union
+   * (OHM's relation has no hole for it), so saying so has to win outright.
+   */
+  parents?: Map<string, string>,
+): { ids: (number | string)[]; counts: Map<number, number>; nodes: Level[] } {
   const none = { ids: [], counts: new Map<number, number>(), nodes: [] };
 
   // Hole-aware, same reason as coveredIds: drilling into the European Union
   // must not claim Switzerland as a member state.
+  // Compared as strings: an added region's id is "edit-ohm-1" and a
+  // Historical-Basemaps one is "hb-3", neither of which survives Number().
   const parent: any[] = [];
   for (const f of feats)
-    if (Number(f.properties?.osm_id) === parentId && f.geometry)
+    if (String(f.properties?.osm_id) === String(parentId) && f.geometry)
       parent.push(f.geometry);
-  if (!parent.length) return none;
+  // An explicit child list stands alone: the parent may be an added region with
+  // no geometry among these features at all.
+  const claimed = parents?.size
+    ? new Set(
+        [...parents.entries()]
+          .filter(([, p]) => p === String(parentId))
+          .map(([c]) => c),
+      )
+    : null;
+  if (!parent.length && !claimed?.size) return none;
 
-  const ids = new Set<number>();
+  const ids = new Set<number | string>();
   const counts = new Map<number, number>();
   const nodes: Level[] = [];
   for (const f of feats) {
@@ -255,9 +293,19 @@ export function childIds(
     // Artifacts have no admin_level; without this floor they counted as a tier
     // and could win nextLevel outright.
     if (!Number.isFinite(al) || al < MIN_REAL_LEVEL || al <= level) continue;
-    const c = centreOf(f.geometry);
-    if (!c || !parent.some((g) => insideGeometry(c, g))) continue;
-    const id = Number(f.properties?.osm_id);
+    const key = String(f.properties?.osm_id);
+    const assigned = parents?.get(key);
+    // Assigned elsewhere: it belongs to another parent and must not also show
+    // up here, however its geometry falls.
+    if (assigned !== undefined && assigned !== String(parentId)) continue;
+    if (assigned === undefined) {
+      const c = centreOf(f.geometry);
+      if (!c || !parent.some((g) => insideGeometry(c, g))) continue;
+    }
+    const raw = f.properties?.osm_id;
+    // Numeric where it can be, so the allow-list filter still matches the
+    // numbers in the tiles; raw otherwise, for "hb-3" and drawn regions.
+    const id = Number.isFinite(Number(raw)) ? Number(raw) : String(raw);
     // Tile clipping means one province arrives as several features; count
     // distinct ids, or a fragmented province outvotes a whole tier.
     if (!ids.has(id)) {

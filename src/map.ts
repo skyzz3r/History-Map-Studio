@@ -16,6 +16,8 @@ import {
   SOURCES,
   dateFilter,
   detectOhm,
+  fillOpacity,
+  lineWidth,
   ohmIsLocal,
   ohmMinZoom,
   normaliseHB,
@@ -29,6 +31,7 @@ import { bboxArea, claimsFrom, overlappingIds, type Sample } from "./claims.ts";
 import { featureArea } from "./geo.ts";
 import {
   childIds,
+  COUNTRY_LEVEL,
   coveredIds,
   focusFilter,
   initialFocus,
@@ -37,6 +40,20 @@ import {
   type FocusState,
   type Level,
 } from "./focus.ts";
+import {
+  addFeature,
+  editFeatures,
+  excludedIds,
+  loadEdits,
+  newEditId,
+  onEditsChange,
+  parentOverrides,
+  setOverride,
+  touchEdits,
+  type EditFeature,
+  type EditProps,
+} from "./edits.ts";
+import { startPolygon } from "./draw.ts";
 
 // ~135 GB, but range requests mean we only ever pull the bytes for visible tiles.
 const BASEMAP = BASEMAP_TILES;
@@ -89,7 +106,13 @@ export const bindFocusChange = (fn: (f: FocusState) => void) => {
 };
 
 export type Picked = {
-  osmId: number;
+  /**
+   * NOT always a number. OHM ids are numeric, but Historical-Basemaps features
+   * carry "hb-3" and regions the user drew carry "edit-ohm-1". Coercing those to
+   * Number gave NaN, and an edit saved against a NaN id was filed under the key
+   * "NaN" — the form showed the change and the map never moved.
+   */
+  osmId: number | string;
   name: string;
   adminLevel?: number;
   startDate?: string;
@@ -137,20 +160,97 @@ function extraClause(layerId: string): any[] | null {
  * and an early return here left a just-attached source permanently unfiltered —
  * CShapes rendered all of 1886-2019 at once. getLayer below is the real guard.
  */
+/**
+ * The clause that hides originals the user has edited or deleted.
+ *
+ * Applied to the DATASET layers only. An edited region is drawn by the edits
+ * overlay instead, so without this both would render — the correction sitting
+ * on top of the thing it corrects.
+ */
+function excludeClause(): any[] {
+  const ids = excludedIds(editSourceId());
+  return ids.length
+    ? [["!", ["in", ["get", "osm_id"], ["literal", ids]]]]
+    : [];
+}
+
+/** The dataset edits belong to: the active border source, never an overlay. */
+function editSourceId(): string {
+  return enabled.find((id) => !SOURCES.find((s) => s.id === id)?.overlay) ?? "ohm";
+}
+
 function applyFilters() {
   if (!map) return;
   const date = dateFilter(currentDate);
   const f = focusFilter(focus, covered);
+  const hide = excludeClause();
   for (const s of active()) {
     // A cosmetic overlay carries no dates and no hierarchy; it keeps the filter
     // its own attach() set, and filtering it here would blank it.
     if (s.overlay) continue;
     for (const id of s.layers) {
       if (!map.getLayer(id)) continue;
-      map.setFilter(id, ["all", date, f, ...(extraClause(id) ?? [])] as never);
+      map.setFilter(id, [
+        "all",
+        date,
+        f,
+        ...hide,
+        ...(extraClause(id) ?? []),
+      ] as never);
     }
   }
+  // The edits overlay carries the same dates and hierarchy as any dataset, but
+  // never the exclusion — it IS the replacement.
+  for (const id of EDIT_LAYERS)
+    if (map.getLayer(id)) map.setFilter(id, ["all", date, f] as never);
   if (map.getLayer("hist-label")) map.setFilter("hist-label", ["all", date, f]);
+}
+
+const EDIT_LAYERS = ["edit-fill", "edit-line"];
+
+/** Push the current source's edits into the overlay. */
+function refreshEdits() {
+  const src = map?.getSource("hist-edits") as maplibregl.GeoJSONSource | undefined;
+  src?.setData(editFeatures(editSourceId()) as never);
+}
+
+/**
+ * The overlay every edit is drawn from. Amber, so a corrected or invented
+ * border never passes for source data.
+ */
+function addEditLayers() {
+  if (!map.getSource("hist-edits"))
+    map.addSource("hist-edits", {
+      type: "geojson",
+      data: { type: "FeatureCollection", features: [] },
+      promoteId: "osm_id",
+    });
+
+  if (!map.getLayer("edit-fill"))
+    map.addLayer(
+      {
+        id: "edit-fill",
+        type: "fill",
+        source: "hist-edits",
+        paint: { "fill-color": "#f59e0b", "fill-opacity": fillOpacity(0.2) },
+      },
+      map.getLayer("hist-label") ? "hist-label" : undefined,
+    );
+  if (!map.getLayer("edit-line"))
+    map.addLayer(
+      {
+        id: "edit-line",
+        type: "line",
+        source: "hist-edits",
+        paint: {
+          "line-color": "#fbbf24",
+          "line-width": lineWidth(),
+          "line-opacity": 0.95,
+        },
+      },
+      map.getLayer("hist-label") ? "hist-label" : undefined,
+    );
+  refreshEdits();
 }
 
 export function setOhmDate(dec: number) {
@@ -291,9 +391,10 @@ async function addHistoryLayers() {
     }
     if (coarse) setCoarse(coarse);
     addLabelLayer();
-    // After the label layer so the mask can anchor beneath it, and inside the
-    // styledata re-attach path so it survives every basemap swap and re-samples
-    // the new flavour's water colour.
+    // After the labels so both anchor beneath them, and inside the styledata
+    // re-attach path so they survive every basemap swap — setStyle drops every
+    // source and layer we own.
+    addEditLayers();
     if (clip) ensureClipMask();
     applyFilters();
     queueLabels();
@@ -459,6 +560,15 @@ export async function setSources(ids: string[]) {
   // empty until you happened to drag the slider.
   if (coarse) setCoarse(coarse);
 
+  // Edits are namespaced per dataset, so switching dataset changes which set is
+  // live: the overlay must be refilled and anything reading it told to re-read.
+  refreshEdits();
+  touchEdits();
+  // The selection belongs to the dataset it was made on. Keeping it would let a
+  // Save write one source's feature id into another's edit set.
+  onEditPick?.(null);
+  parentPick = null;
+
   applyFilters();
   queueLabels();
 }
@@ -522,6 +632,18 @@ export async function initMap(
 // Interaction
 // ---------------------------------------------------------------------------
 
+/**
+ * An id as a number, or null when it is not one.
+ *
+ * Only OHM ids are numeric. Overpass, Wikidata bounds and the flag lookups are
+ * all keyed by real osm ids, so they must be skipped rather than called with
+ * NaN — which is what "hb-3" and a drawn region's "edit-ohm-1" become.
+ */
+const numericId = (id: number | string): number | null => {
+  const n = Number(id);
+  return Number.isFinite(n) && String(id).trim() !== "" ? n : null;
+};
+
 const stateRef = (source: string, sourceLayer: string | undefined, id: string | number) =>
   sourceLayer ? { source, sourceLayer, id } : { source, id };
 
@@ -531,6 +653,7 @@ const SRC_OF: Record<string, [string, string | undefined]> = {
   "ohm-occupation": ["hist-ohm", "boundaries"],
   "hb-fill": ["hist-hb", undefined],
   "cs-fill": ["hist-cs", undefined],
+  "edit-fill": ["hist-edits", undefined],
 };
 
 /** Source id owned by each dataset, so disabling one can remove it cleanly. */
@@ -623,6 +746,23 @@ function hitsAt(point: maplibregl.PointLike): Hit[] {
   const ancestors = new Set(focus.trail.map((t) => String(t.osmId)));
   const isClaim = new Set(claims.map(String));
 
+  // Edits win the click. They are drawn over the dataset and are what the user
+  // most recently asserted is true, so a corrected region must be the thing you
+  // select and re-edit rather than the original showing through.
+  if (map.getLayer("edit-fill")) {
+    const raw = map.queryRenderedFeatures(point, { layers: ["edit-fill"] });
+    if (raw.length) {
+      const s = pickable()[0] ?? active().find((x) => !x.overlay);
+      const seen = new Map<string, Hit>();
+      for (const f of raw) {
+        const id = String(f.properties?.osm_id ?? "");
+        if (!seen.has(id) && s)
+          seen.set(id, { layer: "edit-fill", source: s, f });
+      }
+      if (seen.size) return [...seen.values()];
+    }
+  }
+
   for (const s of pickable()) {
     const layers = (s.pickLayers ?? [s.pickLayer]).filter((l) => map.getLayer(l));
     const raw = layers.length
@@ -667,7 +807,8 @@ const topmost = (point: maplibregl.PointLike): Hit | null =>
 
 function toPicked(p: Record<string, any>): Picked {
   return {
-    osmId: Number(p.osm_id),
+    // Numeric when it can be, the raw value otherwise — see Picked.osmId.
+    osmId: Number.isFinite(Number(p.osm_id)) ? Number(p.osm_id) : String(p.osm_id),
     name: p["name:en"] || p.name || "Unnamed",
     adminLevel: Number(p.admin_level) || undefined,
     startDate: p.start_date || undefined,
@@ -688,6 +829,23 @@ function bindClick(onPick: (p: Picked | null, others: Picked[]) => void) {
     // overlap — a de-facto occupier and the de-jure claimant it displaced —
     // the loser was previously unreachable by any click at all.
     const hits = hitsAt(e.point).filter((h) => h.f.properties);
+
+    // "Pick parent" consumes exactly one click and must not also change the
+    // selection, or choosing a parent would navigate away from the child whose
+    // form is open.
+    if (parentPick) {
+      const fn = parentPick;
+      parentPick = null;
+      if (hits[0]) fn(toPicked(hits[0].f.properties!));
+      return;
+    }
+
+    if (editMode) {
+      setSelected(hits[0] ?? null);
+      onEditPick?.(hits[0] ? toPicked(hits[0].f.properties!) : null);
+      return;
+    }
+
     setSelected(hits[0] ?? null);
     const stack = hits.map((h) => toPicked(h.f.properties!));
     // Clicking away from every polity is a deselect, and a deselect returns to
@@ -788,8 +946,9 @@ export async function drillInto(p: Picked): Promise<boolean> {
   const level = p.adminLevel ?? 2;
   // A Historical-Basemaps feature has a non-numeric osm_id, so this is a no-op
   // for it and cachedBounds stays empty — handled below rather than bailing.
-  if (Number.isFinite(p.osmId)) await fetchTags([p.osmId]);
-  fitTo(cachedBounds(p.osmId));
+  const nid = numericId(p.osmId);
+  if (nid !== null) await fetchTags([nid]);
+  fitTo(nid === null ? undefined : cachedBounds(nid));
 
   if (tip?.osmId !== p.osmId) {
     focus = {
@@ -827,7 +986,8 @@ export function drillOut(index: number) {
   queueLabels();
   notify();
 
-  fitTo(last && cachedBounds(last.osmId));
+  const lastNid = last ? numericId(last.osmId) : null;
+  fitTo(lastNid === null ? undefined : cachedBounds(lastNid));
   // Re-resolve this level's children; the refreshOverlaps pass only widens an
   // existing list, and popping back starts from an empty one.
   if (last) void resolveChildren(last.osmId, last.adminLevel);
@@ -850,7 +1010,10 @@ export function resetFocus() {
  * genuinely inside the parent. Returns whether any were found — the side sheet
  * uses that to disable its button instead of appearing to do nothing.
  */
-async function resolveChildren(osmId: number, level: number): Promise<boolean> {
+async function resolveChildren(
+  osmId: number | string,
+  level: number,
+): Promise<boolean> {
   await whenIdle();
   const r = childrenOf(osmId, level);
   if (!r) return false;
@@ -877,12 +1040,17 @@ async function resolveChildren(osmId: number, level: number): Promise<boolean> {
  * handed to querySourceFeatures directly.
  */
 function childrenOf(
-  osmId: number,
+  osmId: number | string,
   level: number,
-): { ids: number[]; level: number; nodes: Level[] } | null {
+): { ids: (number | string)[]; level: number; nodes: Level[] } | null {
   const feats = sourceFeatures();
   if (!feats) return null;
-  const { ids, counts, nodes } = childIds(feats, osmId, level);
+  const { ids, counts, nodes } = childIds(
+    feats,
+    osmId,
+    level,
+    parentOverrides(currentSourceId()),
+  );
   return { ids, level: nextLevel(level, counts), nodes };
 }
 
@@ -893,10 +1061,23 @@ function sourceFeatures(): maplibregl.GeoJSONFeature[] | null {
   if (!s) return null;
   const [srcId, sourceLayer] = SRC_OF[s.pickLayer] ?? [];
   if (!srcId || !map.getSource(srcId)) return null;
-  return map.querySourceFeatures(srcId, {
+  const base = map.querySourceFeatures(srcId, {
     sourceLayer,
     filter: dateFilter(currentDate),
   });
+  // Edited and added regions have to take part in the hierarchy too, or a
+  // region the user just created could never be drilled into or found as a
+  // child. The excluded originals are dropped so an edit is not counted twice.
+  if (!map.getSource("hist-edits")) return base;
+  const hidden = new Set(excludedIds(currentSourceId()).map(String));
+  const mine = map.querySourceFeatures("hist-edits", {
+    filter: dateFilter(currentDate),
+  });
+  if (!mine.length && !hidden.size) return base;
+  return [
+    ...base.filter((f) => !hidden.has(String(f.properties?.osm_id))),
+    ...mine,
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,7 +1186,10 @@ async function refreshOverlaps() {
   // back, and the cost is a point-in-polygon per country per pass.
   let recovered = false;
   if (!focus.trail.length) {
-    const next = coveredIds(sourceFeatures() ?? []);
+    const next = coveredIds(
+      sourceFeatures() ?? [],
+      parentOverrides(currentSourceId()),
+    );
     if (next.length !== covered.length || next.some((v, i) => v !== covered[i])) {
       covered = next;
       recovered = true;
@@ -1034,7 +1218,9 @@ function rebuildLabels() {
 
   // The claim layer too, or a hatched polity loses its name — the one case
   // where you most need to be told which two countries are involved.
-  const layers = [layer, s?.claimLayer].filter(
+  // The edits overlay too, or a region the user added or renamed has no name on
+  // the map — the one label they are most certain about.
+  const layers = [s?.claimLayer, "edit-fill"].filter(
     (l): l is string => !!l && !!map.getLayer(l) && l !== layer,
   );
   src.setData(
@@ -1128,6 +1314,99 @@ export function setCoarse(data: unknown) {
 export function setGlobe(on: boolean) {
   map.setProjection({ type: on ? "globe" : "mercator" });
 }
+
+// ---------------------------------------------------------------------------
+// Editor
+// ---------------------------------------------------------------------------
+
+/** Which dataset edits are being written against. */
+export const currentSourceId = () => editSourceId();
+
+let editMode = false;
+let onEditPick: ((p: Picked | null) => void) | null = null;
+/** Armed by "Pick parent": the next click reports a polity instead of selecting. */
+let parentPick: ((p: Picked) => void) | null = null;
+
+export function setEditMode(on: boolean, pick?: (p: Picked | null) => void) {
+  editMode = on;
+  onEditPick = on ? (pick ?? null) : null;
+  if (!on) parentPick = null;
+}
+
+export const armParentPick = (fn: (p: Picked) => void) => {
+  parentPick = fn;
+};
+export const disarmParentPick = () => {
+  parentPick = null;
+};
+
+/**
+ * Geometry for a feature the user is about to edit.
+ *
+ * Merged across every piece the source currently holds: tiles clip a country
+ * into several features, and promoting only the piece under the cursor would
+ * silently amputate the rest of it. Multi-piece results become a MultiPolygon.
+ *
+ * ponytail: what is LOADED, not what exists — an edit made while zoomed far out
+ * can snapshot clipped geometry. Upgrade path is Overpass `out geom` per id.
+ */
+export function geometryOf(osmId: string | number): unknown | null {
+  const s = pickable()[0];
+  if (!s) return null;
+  const [srcId, sourceLayer] = SRC_OF[s.pickLayer] ?? [];
+  if (!srcId || !map.getSource(srcId)) return null;
+  const want = String(osmId);
+  const polys: unknown[] = [];
+  for (const f of map.querySourceFeatures(srcId, { sourceLayer })) {
+    if (String(f.properties?.osm_id) !== want) continue;
+    const g: any = f.geometry;
+    if (g?.type === "Polygon") polys.push(g.coordinates);
+    else if (g?.type === "MultiPolygon") polys.push(...g.coordinates);
+  }
+  if (!polys.length) return null;
+  return polys.length === 1
+    ? { type: "Polygon", coordinates: polys[0] }
+    : { type: "MultiPolygon", coordinates: polys };
+}
+
+/** Save a property patch, snapshotting geometry so the overlay can draw it. */
+export function saveEdit(osmId: string | number, props: Partial<EditProps>) {
+  setOverride(currentSourceId(), osmId, props, geometryOf(osmId) ?? undefined);
+}
+
+/**
+ * Draw a new region, then hand it back for the form to fill in.
+ *
+ * Returns the synthetic id, or null when the draw was cancelled. The feature is
+ * stored immediately so a half-filled region is still visible and editable
+ * rather than being lost if the panel closes.
+ */
+export async function drawRegion(): Promise<string | null> {
+  const geometry = await startPolygon(map);
+  if (!geometry) return null;
+  const src = currentSourceId();
+  const doc = loadEdits()[src];
+  const id = newEditId(src, (doc?.added.length ?? 0) + 1);
+  const feat: EditFeature = {
+    type: "Feature",
+    geometry,
+    properties: {
+      osm_id: id,
+      name: "New region",
+      admin_level: COUNTRY_LEVEL,
+    },
+  };
+  addFeature(src, feat);
+  return id;
+}
+
+// Re-render whenever the edit set changes, from anywhere.
+onEditsChange(() => {
+  if (!map) return;
+  refreshEdits();
+  applyFilters();
+  queueLabels();
+});
 
 export { ohmIsLocal, ohmMinZoom };
 

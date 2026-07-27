@@ -31,8 +31,11 @@ import {
   normaliseCShapes,
   normaliseHB,
   normaliseSources,
+  NO_START,
   OCEAN_KINDS,
 } from "./sources.ts";
+import { importEdits, sanitise, withDates, yearNum } from "./edits.ts";
+import { closeRing } from "./draw.ts";
 // The tile pipeline is plain .mjs so CI can run it with no bundler; it has no
 // types. Tested here anyway — its id signing is the one thing that can produce
 // tiles that look perfectly healthy and resolve nothing.
@@ -673,6 +676,82 @@ assert.deepEqual(normaliseSources(["nonsense"]), ["ohm"], "unknown ids drop out"
 assert.ok(OCEAN_KINDS.includes("bay"), "Hudson Bay must be masked");
 assert.ok(!OCEAN_KINDS.includes("lake"), "lakes stay: keeps the Great Lakes border");
 assert.ok(!OCEAN_KINDS.includes("river"), "rivers stay drawn");
+
+// --- edits: the patch layer -------------------------------------------------
+// These run in node, where localStorage does not exist, so the store is exercised
+// through the pure helpers it is built from.
+assert.equal(yearNum(undefined, -99999), -99999, "absent date keeps the sentinel");
+assert.equal(Math.floor(yearNum("1815-06-18", 0)), 1815);
+assert.equal(Math.floor(yearNum("-0218-01-01", 0)), -218, "BC years stay negative");
+assert.equal(yearNum("garbage", 42), 42, "unparseable falls back, never NaN");
+{
+  // The numeric pair is what dateFilter compares, so an edit that sets only the
+  // string would show the new date and change nothing on the map.
+  const p = withDates({ osm_id: 1, end_date: "1806-08-06" });
+  assert.equal(Math.floor(p.end_num!), 1806, "end_date must drive end_num");
+  assert.equal(p.start_num, NO_START, "absent start stays open-ended");
+}
+{
+  // A file that parses but is not an edits document must be refused, not
+  // allowed to wipe the user's work with an empty object.
+  assert.equal(importEdits("not json"), null);
+  assert.equal(importEdits("[1,2,3]"), null, "an array is not an edits doc");
+  assert.equal(importEdits("{}"), null, "empty object is a wrong file, not 'no edits'");
+  const doc = sanitise({
+    ohm: { overrides: { "-123": { props: { name: "X" } } }, added: [] },
+    junk: "nope",
+    hb: { overrides: {}, added: [{ type: "Feature", geometry: {}, properties: {} }] },
+  });
+  assert.deepEqual(Object.keys(doc).sort(), ["hb", "ohm"], "malformed buckets drop");
+  assert.equal(doc.hb.added.length, 1);
+}
+
+{
+  // Regression: a drawn region's id is a STRING ("edit-ohm-1"). The pick path
+  // used to coerce every id with Number(), so the edit was filed under the key
+  // "NaN" — the form showed the change and the map never moved. Found by driving
+  // the live editor, not by any unit test, so it gets one now.
+  const feats = [
+    { properties: { osm_id: "edit-ohm-1", admin_level: 2, name: "Drawn" },
+      geometry: { type: "Polygon", coordinates: [[[0,0],[1,0],[1,1],[0,1],[0,0]]] } },
+  ];
+  // Parent given as a string id must still match its child.
+  const r = childIds(feats, "root-1", 1, new Map([["edit-ohm-1", "root-1"]]));
+  assert.deepEqual(r.ids, ["edit-ohm-1"], "string ids survive as themselves");
+  assert.equal(r.nodes[0].name, "Drawn");
+}
+
+// --- draw: a ring must be an area and must close ---------------------------
+assert.equal(closeRing([[0, 0], [1, 1]] as any), null, "two points is not an area");
+{
+  const r = closeRing([[0, 0], [1, 0], [1, 1]] as any)!;
+  assert.equal(r.length, 4, "the closing point is appended");
+  assert.deepEqual(r[0], r[r.length - 1], "ring closes where it started");
+  // Already closed input must not gain a duplicate point.
+  const already = closeRing([[0, 0], [1, 0], [1, 1], [0, 0]] as any)!;
+  assert.equal(already.length, 4);
+}
+
+// --- parent overrides beat geometry ----------------------------------------
+{
+  const sq = (x: number, y: number, w: number) => ({
+    type: "Polygon",
+    coordinates: [[[x, y], [x + w, y], [x + w, y + w], [x, y + w], [x, y]]],
+  });
+  const feats = [
+    { properties: { osm_id: -1, admin_level: 1, name: "Union" }, geometry: sq(0, 0, 10) },
+    // Inside the union geometrically, but assigned elsewhere by the user.
+    { properties: { osm_id: 2, admin_level: 2, name: "Not a member" }, geometry: sq(1, 1, 2) },
+    // Outside it, but the user says it belongs.
+    { properties: { osm_id: 3, admin_level: 2, name: "Member" }, geometry: sq(50, 50, 2) },
+  ];
+  const parents = new Map([["2", "-999"], ["3", "-1"]]);
+  const r = childIds(feats, -1, 1, parents);
+  assert.deepEqual(r.ids.sort(), [3], "explicit parent wins over containment, both ways");
+  const cov = coveredIds(feats, parents);
+  assert.ok(!cov.includes(2), "a country assigned away is not covered by the union");
+  assert.ok(cov.includes(3), "a country assigned in IS covered, though outside");
+}
 
 // --- childIds hands the diagram real names ---------------------------------
 const named = childIds(
