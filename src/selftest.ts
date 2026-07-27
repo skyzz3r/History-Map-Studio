@@ -34,7 +34,13 @@ import {
   NO_START,
   OCEAN_KINDS,
 } from "./sources.ts";
-import { importEdits, sanitise, withDates, yearNum } from "./edits.ts";
+import {
+  excludedIdsOf,
+  importEdits,
+  sanitise,
+  withDates,
+  yearNum,
+} from "./edits.ts";
 import { closeRing } from "./draw.ts";
 // The tile pipeline is plain .mjs so CI can run it with no bundler; it has no
 // types. Tested here anyway — its id signing is the one thing that can produce
@@ -719,6 +725,28 @@ assert.equal(yearNum("garbage", 42), 42, "unparseable falls back, never NaN");
   const r = childIds(feats, "root-1", 1, new Map([["edit-ohm-1", "root-1"]]));
   assert.deepEqual(r.ids, ["edit-ohm-1"], "string ids survive as themselves");
   assert.equal(r.nodes[0].name, "Drawn");
+}
+
+{
+  // Regression: an edit must never make a region vanish. The original is hidden
+  // only when there is a replacement to draw, so a props edit with no geometry
+  // snapshot leaves the original rendering rather than excluding it into
+  // nothing. Reported live as "made Portugal a child of the empire and it wiped
+  // it off the map".
+  const doc = sanitise({
+    ohm: {
+      overrides: {
+        "-1": { props: { name: "no geometry captured" } },
+        "-2": { props: { name: "ok" }, geometry: { type: "Polygon", coordinates: [] } },
+        "-3": { deleted: true },
+      },
+      added: [],
+    },
+  });
+  const ex = excludedIdsOf(doc, "ohm");
+  assert.ok(!ex.includes(-1), "no geometry -> original stays visible, never hidden into nothing");
+  assert.ok(ex.includes(-2), "an edit WITH geometry hides the original it replaces");
+  assert.ok(ex.includes(-3), "a delete always hides");
 }
 
 // --- draw: a ring must be an area and must close ---------------------------

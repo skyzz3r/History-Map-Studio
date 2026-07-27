@@ -201,8 +201,16 @@ function applyFilters() {
   }
   // The edits overlay carries the same dates and hierarchy as any dataset, but
   // never the exclusion — it IS the replacement.
+  //
+  // And never the world-view de-duplication while editing. `covered` hides a
+  // country that an empire stands in for, and saying "this region belongs to
+  // that empire" puts the region straight into that set: assigning the Kingdom
+  // of Portugal to the Portuguese Empire excluded it from the dataset layer AND
+  // hid it here, so a parent edit looked exactly like a delete. An edit must
+  // always be visible to the person making it.
+  const fEdits = editMode ? focusFilter(focus, []) : f;
   for (const id of EDIT_LAYERS)
-    if (map.getLayer(id)) map.setFilter(id, ["all", date, f] as never);
+    if (map.getLayer(id)) map.setFilter(id, ["all", date, fEdits] as never);
   if (map.getLayer("hist-label")) map.setFilter("hist-label", ["all", date, f]);
 }
 
@@ -1331,6 +1339,9 @@ export function setEditMode(on: boolean, pick?: (p: Picked | null) => void) {
   editMode = on;
   onEditPick = on ? (pick ?? null) : null;
   if (!on) parentPick = null;
+  // The overlay is filtered differently in edit mode (it ignores the world-view
+  // de-duplication), so the filters have to be rebuilt on the way in AND out.
+  if (map) applyFilters();
 }
 
 export const armParentPick = (fn: (p: Picked) => void) => {
@@ -1369,9 +1380,26 @@ export function geometryOf(osmId: string | number): unknown | null {
     : { type: "MultiPolygon", coordinates: polys };
 }
 
-/** Save a property patch, snapshotting geometry so the overlay can draw it. */
-export function saveEdit(osmId: string | number, props: Partial<EditProps>) {
-  setOverride(currentSourceId(), osmId, props, geometryOf(osmId) ?? undefined);
+/**
+ * Save a property patch, snapshotting geometry so the overlay can draw it.
+ *
+ * Returns false when no geometry could be captured — the edit is still stored,
+ * but the original keeps rendering unedited until it is saved again with the
+ * feature on screen. Reported rather than silent: this used to leave the region
+ * excluded from its dataset and absent from the overlay, i.e. gone.
+ */
+export function saveEdit(
+  osmId: string | number,
+  props: Partial<EditProps>,
+): boolean {
+  const src = currentSourceId();
+  const geom = geometryOf(osmId);
+  setOverride(src, osmId, props, geom ?? undefined);
+  // An added region carries its own geometry and never needs a snapshot.
+  const added = loadEdits()[src]?.added.some(
+    (f) => String(f.properties.osm_id) === String(osmId),
+  );
+  return !!added || !!geom || !!loadEdits()[src]?.overrides[String(osmId)]?.geometry;
 }
 
 /**

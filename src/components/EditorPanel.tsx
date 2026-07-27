@@ -85,11 +85,14 @@ export default function EditorPanel({
 
   const save = () => {
     if (!picked) return;
-    saveEdit(picked.osmId, {
+    const ok = saveEdit(picked.osmId, {
       ...form,
       parent: parent.id === undefined || parent.id === "" ? undefined : parent.id,
     });
-    flash("Saved");
+    // Geometry is snapshotted from the loaded tiles, so an edit made with the
+    // region off screen has nothing to redraw. Say so instead of appearing to
+    // save and changing nothing.
+    flash(ok ? "Saved" : "Saved, but zoom to the region and save again to apply");
   };
 
   const deleted = deletedIds(src);

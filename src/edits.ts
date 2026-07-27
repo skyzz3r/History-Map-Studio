@@ -255,12 +255,20 @@ export function yearNum(date: string | undefined, fallback: number): number {
  * that the overlay now draws instead. Both cases would otherwise show the
  * unedited original underneath the replacement.
  */
-export function excludedIds(src: string): (string | number)[] {
-  const b = loadEdits()[src];
+export const excludedIds = (src: string): (string | number)[] =>
+  excludedIdsOf(loadEdits(), src);
+
+/** The pure half, so the "never hide into nothing" rule can be tested. */
+export function excludedIdsOf(doc: EditsDoc, src: string): (string | number)[] {
+  const b = doc[src];
   if (!b) return [];
   const out: (string | number)[] = [];
   for (const [id, o] of Object.entries(b.overrides)) {
-    if (!o.deleted && !o.props) continue;
+    // A property edit hides the original ONLY when there is a replacement to
+    // draw. Without the geometry snapshot the feature would be excluded here
+    // and absent from the overlay — the region would simply vanish, which is
+    // the worst possible outcome of pressing Save.
+    if (!o.deleted && !(o.props && o.geometry)) continue;
     // Tile ids are numbers; a string would never match ["in", ["get","osm_id"]].
     const n = Number(id);
     out.push(Number.isFinite(n) && id.trim() !== "" ? n : id);
