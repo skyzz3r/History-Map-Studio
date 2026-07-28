@@ -71,6 +71,9 @@ export default function MapControls() {
       <button
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
+        aria-label={`Border source: ${
+          SOURCES.find((s) => s.id === current)?.label ?? "none"
+        }. ${open ? "Collapse" : "Expand"} source options.`}
         className="flex items-center justify-between rounded-md px-1 py-0.5 text-left text-neutral-300 hover:text-neutral-100"
       >
         <span>
@@ -200,12 +203,44 @@ export default function MapControls() {
           onChange={(e) => setUrl(e.target.value)}
           placeholder="style.json URL (e.g. MapTiler)"
           aria-label="Custom style URL"
-          className="min-w-0 flex-1 rounded-md border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-200 placeholder:text-neutral-600"
+          className="min-w-0 flex-1 rounded-md border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-200 placeholder:text-neutral-400"
         />
         <button className="shrink-0 rounded-md bg-neutral-800 px-2 py-1 text-xs">
           Load
         </button>
       </form>
+
+      {/* The map's fill colours carry meaning the panels never spell out. A
+          collapsed disclosure keeps the chrome minimal but stops the colour code
+          being learned by trial and error. */}
+      <details className="border-t border-neutral-800 pt-2 text-xs">
+        <summary className="cursor-pointer select-none text-neutral-300 hover:text-neutral-100">
+          Legend
+        </summary>
+        <ul className="mt-2 flex flex-col gap-1.5 text-neutral-300">
+          {LEGEND.map((it) => (
+            <li key={it.label} className="flex items-center gap-2">
+              <span
+                aria-hidden
+                className="h-3 w-4 shrink-0 rounded-[3px] border"
+                style={{ background: it.fill, borderColor: it.border }}
+              />
+              <span className="leading-snug">{it.label}</span>
+            </li>
+          ))}
+        </ul>
+      </details>
     </div>
   );
 }
+
+/** Swatches for the map's fill/line colours — kept in step with sources.ts. */
+const LEGEND = [
+  { label: "Empire / union & its members", fill: "#a78bfa", border: "#c4b5fd" },
+  { label: "Country", fill: "#e5e7eb", border: "#f8fafc" },
+  { label: "Region / province", fill: "#94a3b8", border: "#cbd5e1" },
+  { label: "Disputed border", fill: "#d97706", border: "#f59e0b" },
+  { label: "Occupation zone (by holder)", fill: "#dc2626", border: "#0f172a" },
+  { label: "Your unsaved edits", fill: "#f59e0b", border: "#fbbf24" },
+  { label: "Present-day reference", fill: "transparent", border: "#22d3ee" },
+] as const;

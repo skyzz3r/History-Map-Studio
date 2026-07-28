@@ -45,7 +45,9 @@ export default function EditorPanel({
   const [form, setForm] = useState<Partial<EditProps>>({});
   const [parent, setParent] = useState<{ id?: string; name?: string }>({});
   const [picking, setPicking] = useState(false);
-  const [note, setNote] = useState<string | null>(null);
+  const [note, setNote] = useState<{ msg: string; undo?: () => void } | null>(
+    null,
+  );
   const [, bump] = useState(0);
   const file = useRef<HTMLInputElement>(null);
 
@@ -75,9 +77,11 @@ export default function EditorPanel({
     setParent({ id: merged.parent === undefined ? undefined : String(merged.parent) });
   }, [picked, src]);
 
-  const flash = (m: string) => {
-    setNote(m);
-    setTimeout(() => setNote(null), 2500);
+  // A plain note self-clears fast; a note with an Undo lingers so the recovery
+  // is actually reachable before it disappears.
+  const flash = (msg: string, undo?: () => void) => {
+    setNote({ msg, undo });
+    setTimeout(() => setNote(null), undo ? 6000 : 2500);
   };
 
   const set = (k: keyof EditProps, v: unknown) =>
@@ -192,7 +196,22 @@ export default function EditorPanel({
         />
       </div>
 
-      {note && <p className="text-xs text-amber-300">{note}</p>}
+      {note && (
+        <p className="flex items-center gap-2 text-xs text-amber-300">
+          <span className="min-w-0 flex-1">{note.msg}</span>
+          {note.undo && (
+            <button
+              onClick={() => {
+                note.undo!();
+                setNote(null);
+              }}
+              className="shrink-0 rounded bg-amber-500/20 px-1.5 py-0.5 font-medium text-amber-200 hover:bg-amber-500/30"
+            >
+              Undo
+            </button>
+          )}
+        </p>
+      )}
 
       {!picked ? (
         <p className="text-xs leading-snug text-neutral-500">
@@ -302,8 +321,9 @@ export default function EditorPanel({
             </button>
             <button
               onClick={() => {
-                deleteFeature(src, picked.osmId);
-                flash("Deleted");
+                const id = picked.osmId;
+                deleteFeature(src, id);
+                flash("Deleted", () => restore(src, id));
               }}
               className="rounded-md px-2.5 py-1 text-xs text-red-300 hover:bg-neutral-800"
             >
@@ -336,7 +356,7 @@ export default function EditorPanel({
         </div>
       )}
 
-      <p className="text-[11px] leading-snug text-neutral-600">
+      <p className="text-[11px] leading-snug text-neutral-400">
         {total} edit(s) to {label} · saved in this browser. Export to keep or
         move them.
       </p>

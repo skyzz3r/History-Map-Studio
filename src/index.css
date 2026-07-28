@@ -24,6 +24,15 @@ datalist {
   display: none;
 }
 
+/* Keyboard focus was invisible: every control fell back to the UA default, which
+   all but disappears on dark translucent glass. One bright, offset ring, shown
+   only for keyboard/AT users (not mouse clicks), for every interactive element. */
+:focus-visible {
+  outline: 2px solid #f5f5f5;
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
 .maplibregl-ctrl-attrib {
   font-size: 10px;
   background: rgb(23 23 23 / 0.8) !important;

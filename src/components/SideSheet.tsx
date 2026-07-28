@@ -30,7 +30,7 @@ export default function SideSheet({
         </h2>
         <button
           onClick={onClose}
-          aria-label="Close"
+          aria-label="Close details"
           className="shrink-0 rounded px-2 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100"
         >
           ✕

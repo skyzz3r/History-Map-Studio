@@ -52,7 +52,7 @@ export default function HierarchyPanel({
         </h2>
         <button
           onClick={onClose}
-          aria-label="Hide hierarchy"
+          aria-label="Close hierarchy"
           className="rounded px-1 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
         >
           ✕
@@ -69,6 +69,7 @@ export default function HierarchyPanel({
             <button
               onClick={n.onClick}
               disabled={!n.onClick}
+              aria-label={`${n.name}, ${n.tier}${n.current ? ", current level" : ""}`}
               className={`my-0.5 min-w-0 flex-1 rounded px-2 py-1 text-left ${
                 n.current
                   ? "bg-neutral-100/10 text-neutral-100 ring-1 ring-neutral-100/25"
@@ -107,7 +108,7 @@ export default function HierarchyPanel({
             ))}
           </ul>
           {kids.length > 12 && (
-            <p className="pl-6 text-[11px] text-neutral-600">
+            <p className="pl-6 text-[11px] text-neutral-400">
               +{kids.length - 12} more
             </p>
           )}
@@ -118,12 +119,12 @@ export default function HierarchyPanel({
           announced "No subdivisions recorded here" for the second or two before
           the European Union's 32 member states arrived. */}
       {!kids.length && focus.trail.length > 0 && (
-        <p className="pl-6 text-[11px] text-neutral-600">
+        <p className="pl-6 text-[11px] text-neutral-400">
           {focus.resolved ? "No subdivisions recorded here." : "Looking…"}
         </p>
       )}
 
-      <p className="text-[11px] leading-snug text-neutral-600">
+      <p className="text-[11px] leading-snug text-neutral-400">
         Double-click a territory to go deeper · Esc to go up
       </p>
     </section>

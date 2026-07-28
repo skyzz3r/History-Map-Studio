@@ -62,7 +62,8 @@ export default function App() {
         setFocus(getFocus());
         applyIndex(snaps.length - 1, true); // open on the present day
       } catch (e) {
-        setError(String(e));
+        console.error(e);
+        setError("Couldn’t load the map data. Check your connection and reload.");
       }
     })();
     return () => {
@@ -131,6 +132,7 @@ export default function App() {
         </h1>
         <button
           onClick={() => setStudio((s) => !s)}
+          title="Studio: capture camera keyframes and render a fly-through video of the era."
           className="pointer-events-auto rounded-lg bg-neutral-900/80 px-3 py-1.5 text-sm backdrop-blur hover:bg-neutral-800"
         >
           {studio ? "Exploration" : "Studio"}
@@ -138,6 +140,7 @@ export default function App() {
         <button
           onClick={() => setEditor((e) => !e)}
           aria-pressed={editor}
+          title="Edit borders: correct a region’s dates, level or parent. Changes are saved in this browser."
           className={`pointer-events-auto rounded-lg px-3 py-1.5 text-sm backdrop-blur ${
             editor
               ? "bg-amber-500 font-medium text-neutral-900"
