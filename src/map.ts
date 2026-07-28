@@ -402,18 +402,69 @@ export const BASEMAPS: Basemap[] = [
 const STORE = "basemap";
 export const savedBasemap = () => localStorage.getItem(STORE) ?? "dark";
 
+// ---- Named custom basemaps -------------------------------------------------
+// A pasted style URL used to live in the single `basemap` slot, anonymous and
+// one-at-a-time. These persist a NAMED list beside it (same JSON-array shape as
+// savedSources), so a MapTiler style can be saved once and picked again next
+// session. `basemap` still holds the active choice — now possibly a custom id.
+
+export type CustomBasemap = { id: string; label: string; url: string };
+const CUSTOM_STORE = "basemaps:custom";
+
+export function savedCustomBasemaps(): CustomBasemap[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(CUSTOM_STORE) ?? "[]");
+    return Array.isArray(v)
+      ? v.filter(
+          (b) => b && typeof b.id === "string" && typeof b.url === "string",
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Save (or re-label) a style URL and return its entry. Same URL is reused
+ *  rather than duplicated, so re-saving is idempotent. */
+export function saveCustomBasemap(label: string, url: string): CustomBasemap {
+  const list = savedCustomBasemaps();
+  const existing = list.find((b) => b.url === url);
+  if (existing) {
+    if (label && label !== existing.label) {
+      existing.label = label;
+      localStorage.setItem(CUSTOM_STORE, JSON.stringify(list));
+    }
+    return existing;
+  }
+  const n =
+    list.reduce((m, b) => Math.max(m, Number(b.id.slice(7)) || 0), 0) + 1;
+  const entry = { id: `custom-${n}`, label: label || `Custom ${n}`, url };
+  localStorage.setItem(CUSTOM_STORE, JSON.stringify([...list, entry]));
+  return entry;
+}
+
+export function removeCustomBasemap(id: string) {
+  localStorage.setItem(
+    CUSTOM_STORE,
+    JSON.stringify(savedCustomBasemaps().filter((b) => b.id !== id)),
+  );
+}
+
 /**
- * Swap the backdrop. `choice` is a BASEMAPS id or any style URL — a MapTiler
- * `https://api.maptiler.com/maps/<style>/style.json?key=…` pastes straight in.
+ * Swap the backdrop. `choice` is a BASEMAPS id, a saved custom id, or any style
+ * URL — a MapTiler `https://api.maptiler.com/maps/<style>/style.json?key=…`
+ * pastes straight in.
  */
 export async function setBasemap(choice: string) {
   localStorage.setItem(STORE, choice);
   const preset = BASEMAPS.find((b) => b.id === choice);
+  const custom = savedCustomBasemaps().find((b) => b.id === choice);
   // setStyle wipes every source and layer, ours included. The persistent
   // styledata listener installed in initMap puts them back — NOT a `once` here,
   // because styledata can fire while the outgoing style is still torn down, and
   // that first event would be consumed by a no-op.
-  map.setStyle((preset ? await preset.style() : choice) as StyleSpecification);
+  const style = preset ? await preset.style() : (custom?.url ?? choice);
+  map.setStyle(style as StyleSpecification);
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +795,23 @@ function membersOf(parentId: string | number): (string | number)[] {
     out.push(Number.isFinite(n) && child.trim() !== "" ? n : child);
   }
   return out;
+}
+
+/**
+ * Is an empire/union fill actually rendered at this lng/lat? The covered-country
+ * test in focus.ts uses tile-clipped geometry and can mark a country as covered
+ * where the rendered empire in fact has a hole (the reported empty France), so
+ * coveredIds only trusts a candidate once this confirms the GPU drew an empire
+ * over it — a hidden country is then never an unpainted hole. queryRenderedFeatures
+ * reads the composited frame, so it is meaningful only after the view has settled,
+ * which is exactly when refreshOverlaps runs.
+ */
+function empireFillAt(centre: [number, number]): boolean {
+  if (!map?.getLayer("ohm-fill")) return false;
+  const p = map.project(centre);
+  return map
+    .queryRenderedFeatures(p, { layers: ["ohm-fill"] })
+    .some((f) => Number(f.properties?.admin_level) <= ROOT_LEVEL);
 }
 
 /** osm_ids of the empires/unions in the loaded tiles, so membership can be
@@ -1375,6 +1443,7 @@ async function refreshOverlaps() {
     const next = coveredIds(
       sourceFeatures() ?? [],
       parentOverrides(currentSourceId()),
+      empireFillAt,
     );
     if (next.length !== covered.length || next.some((v, i) => v !== covered[i])) {
       covered = next;

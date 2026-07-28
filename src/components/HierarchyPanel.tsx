@@ -44,7 +44,7 @@ export default function HierarchyPanel({
   return (
     <section
       aria-label="Territory hierarchy"
-      className="pointer-events-auto flex w-64 flex-col gap-2 rounded-lg bg-neutral-900/85 p-3 text-sm backdrop-blur"
+      className="panel pointer-events-auto flex w-64 flex-col gap-2 overflow-y-auto p-3 text-sm"
     >
       <div className="flex items-center justify-between">
         <h2 className="text-xs uppercase tracking-wide text-neutral-500">
@@ -52,7 +52,7 @@ export default function HierarchyPanel({
         </h2>
         <button
           onClick={onClose}
-          aria-label="Close hierarchy"
+          aria-label="Collapse panel"
           className="rounded px-1 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
         >
           ✕

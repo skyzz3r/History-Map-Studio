@@ -24,6 +24,16 @@ datalist {
   display: none;
 }
 
+/* One shell for every floating surface. The panels used to each declare their
+   own bg/blur/border/radius at slightly different opacities (85 vs 90 vs 95),
+   which read as five separate widgets. This is the single source of truth. */
+.panel {
+  background: rgb(23 23 23 / 0.9);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgb(64 64 64 / 0.6);
+  border-radius: 0.625rem;
+}
+
 /* Keyboard focus was invisible: every control fell back to the UA default, which
    all but disappears on dark translucent glass. One bright, offset ring, shown
    only for keyboard/AT users (not mouse clicks), for every interactive element. */

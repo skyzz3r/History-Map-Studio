@@ -32,7 +32,11 @@ export const dateFilter = (dec: number): any => [
  * 0.22 to 0.4, CShapes from 0.16 to 0.4. Switching dataset therefore changed how
  * the map *felt*, and nothing at all marked the polity you had actually clicked.
  */
-export const fillOpacity = (base = 0.12): any => [
+// Base is deliberately faint: a translucent fill over EVERY territory (empires
+// included, so whole continents) washed the colour out of the Protomaps light and
+// dark basemaps. The borders are carried by the line layers at full opacity, so
+// the fill only needs to hint extent at rest and lift on hover/selection.
+export const fillOpacity = (base = 0.06): any => [
   "case",
   ["boolean", ["feature-state", "selected"], false], 0.5,
   ["boolean", ["feature-state", "hover"], false], 0.32,

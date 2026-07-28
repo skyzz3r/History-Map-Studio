@@ -22,6 +22,16 @@ import MapControls from "./components/MapControls.tsx";
 import HierarchyPanel from "./components/HierarchyPanel.tsx";
 import EditorPanel from "./components/EditorPanel.tsx";
 
+/** One explicit mode instead of three booleans that used to combine into a
+ *  screenful of overlapping panels. Exactly one mode panel is docked at a time. */
+type Mode = "explore" | "studio" | "edit";
+
+const MODES: { id: Mode; label: string; title: string }[] = [
+  { id: "explore", label: "Explore", title: "Browse the map and drill the territory hierarchy" },
+  { id: "studio", label: "Studio", title: "Capture camera keyframes and render a fly-through video" },
+  { id: "edit", label: "Edit", title: "Correct a region’s dates, level or parent — saved in this browser" },
+];
+
 export default function App() {
   const container = useRef<HTMLDivElement>(null);
   const [count, setCount] = useState(0);
@@ -30,11 +40,10 @@ export default function App() {
   // Everything else under the same click, so an overlapped polity stays reachable.
   const [others, setOthers] = useState<Picked[]>([]);
   const [info, setInfo] = useState<Info | null>(null);
-  const [studio, setStudio] = useState(false);
+  const [mode, setMode] = useState<Mode>("explore");
+  const [railOpen, setRailOpen] = useState(true);
   const [keys, setKeys] = useState<Key[]>([]);
   const [focus, setFocus] = useState<FocusState>(initialFocus);
-  const [tree, setTree] = useState(true);
-  const [editor, setEditor] = useState(false);
   /** What the editor is editing. Separate from `picked`, which drives the side
    *  sheet — in edit mode a click means "edit this", not "tell me about this". */
   const [editing, setEditing] = useState<Picked | null>(null);
@@ -75,13 +84,14 @@ export default function App() {
   // instead of opening the side sheet. Leaving it clears both, so an old
   // selection cannot be silently saved against.
   useEffect(() => {
-    setEditMode(editor, setEditing);
-    if (!editor) setEditing(null);
+    const editing = mode === "edit";
+    setEditMode(editing, setEditing);
+    if (!editing) setEditing(null);
     else {
       setPicked(null);
       setOthers([]);
     }
-  }, [editor]);
+  }, [mode]);
 
   // Entity lookup is keyed to the polygon AND the year on screen when it was
   // clicked. The clicked OHM feature has a `wikidata` tag ~90% of the time, so
@@ -126,78 +136,96 @@ export default function App() {
       {/* Sized by #map in index.css, not Tailwind — see the comment there. */}
       <div ref={container} id="map" />
 
-      <header className="pointer-events-none absolute inset-x-0 top-0 flex items-center gap-3 p-4">
-        <h1 className="pointer-events-auto rounded-lg bg-neutral-900/80 px-3 py-1.5 text-sm font-medium tracking-tight backdrop-blur">
-          Interactive History Map
-        </h1>
-        <button
-          onClick={() => setStudio((s) => !s)}
-          title="Studio: capture camera keyframes and render a fly-through video of the era."
-          className="pointer-events-auto rounded-lg bg-neutral-900/80 px-3 py-1.5 text-sm backdrop-blur hover:bg-neutral-800"
-        >
-          {studio ? "Exploration" : "Studio"}
-        </button>
-        <button
-          onClick={() => setEditor((e) => !e)}
-          aria-pressed={editor}
-          title="Edit borders: correct a region’s dates, level or parent. Changes are saved in this browser."
-          className={`pointer-events-auto rounded-lg px-3 py-1.5 text-sm backdrop-blur ${
-            editor
-              ? "bg-amber-500 font-medium text-neutral-900"
-              : "bg-neutral-900/80 hover:bg-neutral-800"
-          }`}
-        >
-          {editor ? "Editing" : "Edit borders"}
-        </button>
-        {error && (
-          <span className="pointer-events-auto rounded-lg bg-red-950/90 px-3 py-1.5 text-sm text-red-200">
-            {error}
-          </span>
-        )}
-        {/* The breadcrumb lived here and was deleted: the hierarchy panel shows
-            the same spine, with the tiers named and the children listed, and two
-            controls carrying the same aria-label was its own bug. */}
-        {!tree && (
-          <button
-            onClick={() => setTree(true)}
-            className="pointer-events-auto rounded-lg bg-neutral-900/80 px-3 py-1.5 text-sm backdrop-blur hover:bg-neutral-800"
+      {/* Top bar: mode selector on the left, map/data controls on the right. */}
+      <header className="pointer-events-none absolute inset-x-0 top-0 z-30 flex items-start gap-3 p-4">
+        <div className="pointer-events-auto flex items-center gap-3">
+          <h1 className="panel px-3 py-1.5 text-sm font-medium tracking-tight">
+            Interactive History Map
+          </h1>
+          <div
+            role="tablist"
+            aria-label="Mode"
+            className="panel flex gap-0.5 p-0.5 text-sm"
           >
-            Hierarchy
-          </button>
-        )}
-        <div className="ml-auto">
+            {MODES.map((m) => (
+              <button
+                key={m.id}
+                role="tab"
+                aria-selected={mode === m.id}
+                title={m.title}
+                onClick={() => {
+                  setMode(m.id);
+                  setRailOpen(true);
+                }}
+                className={`rounded-md px-3 py-1 ${
+                  mode === m.id
+                    ? "bg-neutral-100 font-medium text-neutral-900"
+                    : "text-neutral-300 hover:bg-neutral-800"
+                }`}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+          {error && (
+            <span className="rounded-lg bg-red-950/90 px-3 py-1.5 text-sm text-red-200">
+              {error}
+            </span>
+          )}
+        </div>
+        <div className="pointer-events-auto ml-auto">
           <MapControls />
         </div>
       </header>
 
-      {tree && (
-        <div className="absolute left-4 top-20 z-10">
-          <HierarchyPanel
-            focus={focus}
-            onJump={drillOut}
-            onDrill={(n) =>
-              void drillInto({
-                osmId: n.osmId,
-                name: n.name,
-                adminLevel: n.adminLevel,
-              })
-            }
-            onClose={() => setTree(false)}
-          />
+      {/* One left rail owns the current mode's panel — Explore→Hierarchy,
+          Edit→Editor. Studio's transport is a bottom dock (below), timeline-
+          adjacent by nature. Exactly one is ever on screen, so panels can no
+          longer stack or collide. */}
+      {mode !== "studio" && (
+        <div className="absolute bottom-28 left-4 top-20 z-10 flex items-start">
+          {railOpen ? (
+            <div className="pointer-events-auto flex max-h-full">
+              {mode === "explore" && (
+                <HierarchyPanel
+                  focus={focus}
+                  onJump={drillOut}
+                  onDrill={(n) =>
+                    void drillInto({
+                      osmId: n.osmId,
+                      name: n.name,
+                      adminLevel: n.adminLevel,
+                    })
+                  }
+                  onClose={() => setRailOpen(false)}
+                />
+              )}
+              {mode === "edit" && (
+                <EditorPanel
+                  picked={editing}
+                  onClose={() => setMode("explore")}
+                />
+              )}
+            </div>
+          ) : (
+            <button
+              onClick={() => setRailOpen(true)}
+              aria-label="Show panel"
+              className="panel pointer-events-auto px-2.5 py-1.5 text-sm text-neutral-200 hover:bg-neutral-800"
+            >
+              ☰
+            </button>
+          )}
         </div>
       )}
 
-      {editor && (
-        <div className="absolute right-4 top-20 z-10">
-          <EditorPanel picked={editing} onClose={() => setEditor(false)} />
-        </div>
+      {mode === "studio" && (
+        <StudioBar keys={keys} setKeys={setKeys} max={count - 1} />
       )}
-
-      {studio && <StudioBar keys={keys} setKeys={setKeys} max={count - 1} />}
 
       <Timeline max={count - 1} />
 
-      {picked && !editor && (
+      {picked && mode !== "edit" && (
         <SideSheet
           picked={picked}
           info={info}

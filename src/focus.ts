@@ -160,6 +160,18 @@ export function coveredIds(
   feats: { properties?: any; geometry?: any }[],
   /** child -> parent from user edits; see childIds. */
   parents?: Map<string, string>,
+  /**
+   * "Is an empire fill actually painted at this point on the rendered map?"
+   * The geometry test below runs on TILE-CLIPPED source geometry: a tile piece
+   * of an empire's outer ring can span a country whose hole lives in another
+   * tile, so the country tests "inside" and loses its fill — while the RENDERED
+   * empire keeps the hole and paints nothing there. That is the reported empty
+   * France: covered by geometry, but no empire fill behind it. This predicate is
+   * the truth of what the GPU actually drew; a candidate only counts as covered
+   * when an empire really paints over it, so a hidden country is never a hole.
+   * Omitted (node/tests) → geometry decides alone, the prior behaviour.
+   */
+  paints?: (centre: [number, number]) => boolean,
 ): number[] {
   const roots: any[] = [];
   const rootIds = new Set<string>();
@@ -175,7 +187,9 @@ export function coveredIds(
     }
   if (!roots.length) return [];
 
-  const out = new Set<number>();
+  // Candidates first (geometry), then the paint guard, so a country is only
+  // hidden when something is proven to draw over it.
+  const cand: { id: number; centre: [number, number] }[] = [];
   for (const f of feats) {
     if (Number(f.properties?.admin_level) !== COUNTRY_LEVEL) continue;
     // An explicit parent settles WHICH empire, but not whether that empire
@@ -193,7 +207,7 @@ export function coveredIds(
       const gs = rootGeom.get(assigned) ?? [];
       const id0 = Number(f.properties?.osm_id);
       if (c && gs.some((g) => insideGeometry(c, g)) && Number.isFinite(id0))
-        out.add(id0);
+        cand.push({ id: id0, centre: c });
       continue;
     }
     const c = centreOf(f.geometry);
@@ -208,9 +222,11 @@ export function coveredIds(
     // and fixing it properly means membership data this dataset does not carry.
     if (!c || !roots.some((g) => insideGeometry(c, g))) continue;
     const id = Number(f.properties?.osm_id);
-    if (Number.isFinite(id)) out.add(id);
+    if (Number.isFinite(id)) cand.push({ id, centre: c });
   }
-  return [...out];
+
+  const kept = paints ? cand.filter((x) => paints(x.centre)) : cand;
+  return [...new Set(kept.map((x) => x.id))];
 }
 
 /**

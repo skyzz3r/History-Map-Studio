@@ -122,8 +122,7 @@ export default function EditorPanel({
   return (
     <section
       aria-label="Border editor"
-      className="pointer-events-auto flex w-80 flex-col gap-3 overflow-y-auto rounded-lg bg-neutral-900/95 p-3 text-sm backdrop-blur"
-      style={{ maxHeight: "calc(100dvh - 12rem)" }}
+      className="panel pointer-events-auto flex w-80 flex-col gap-3 overflow-y-auto p-3 text-sm"
     >
       <div className="flex items-start justify-between gap-2">
         <div>

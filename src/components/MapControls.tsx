@@ -1,8 +1,11 @@
 import { useState } from "react";
 import {
   BASEMAPS,
+  removeCustomBasemap,
+  saveCustomBasemap,
   savedBasemap,
   savedClip,
+  savedCustomBasemaps,
   setBasemap,
   setClip,
   setGlobe,
@@ -26,6 +29,8 @@ export default function MapControls() {
   const [choice, setChoice] = useState(savedBasemap);
   const [globe, setGlobeOn] = useState(false);
   const [url, setUrl] = useState("");
+  const [name, setName] = useState("");
+  const [customs, setCustoms] = useState(savedCustomBasemaps);
   // savedSources(), not the map's runtime list: this component mounts before
   // initMap has populated that, so reading it there left every box unchecked
   // while OHM and Historical-Basemaps were plainly rendering.
@@ -64,10 +69,13 @@ export default function MapControls() {
   const overlays = SOURCES.filter((s) => s.overlay);
   const current = on.find((id) => !isOverlay(id)) ?? datasets[0]?.id;
 
-  const custom = !BASEMAPS.some((b) => b.id === choice);
+  const isPreset = BASEMAPS.some((b) => b.id === choice);
+  const activeCustom = customs.find((c) => c.id === choice);
+  // A raw pasted URL that has not been saved: neither a preset nor a saved id.
+  const rawUrl = !isPreset && !activeCustom;
 
   return (
-    <div className="pointer-events-auto flex w-64 flex-col gap-2 rounded-lg bg-neutral-900/85 p-2 text-sm backdrop-blur">
+    <div className="panel pointer-events-auto flex w-64 flex-col gap-2 p-2 text-sm">
       <button
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
@@ -162,7 +170,7 @@ export default function MapControls() {
 
       <div className="flex items-center gap-2">
         <select
-          value={custom ? "custom" : choice}
+          value={rawUrl ? "custom" : choice}
           onChange={(e) => e.target.value !== "custom" && pick(e.target.value)}
           aria-label="Basemap"
           className="min-w-0 flex-1 rounded-md border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-200"
@@ -172,7 +180,16 @@ export default function MapControls() {
               {b.label}
             </option>
           ))}
-          {custom && <option value="custom">Custom URL</option>}
+          {customs.length > 0 && (
+            <optgroup label="Saved styles">
+              {customs.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.label}
+                </option>
+              ))}
+            </optgroup>
+          )}
+          {rawUrl && <option value="custom">Custom URL (unsaved)</option>}
         </select>
 
         <button
@@ -189,14 +206,36 @@ export default function MapControls() {
         </button>
       </div>
 
-      {/* Any MapLibre style URL, including a MapTiler one with your own key.
-          Kept out of the build so no key is baked into the deployed bundle. */}
+      {/* Remove the active saved style. Shown only while one is selected; falls
+          back to the default backdrop so the map is never left on a dead id. */}
+      {activeCustom && (
+        <button
+          onClick={() => {
+            removeCustomBasemap(activeCustom.id);
+            setCustoms(savedCustomBasemaps());
+            pick("dark");
+          }}
+          className="self-start rounded px-1 text-xs text-red-300 hover:bg-neutral-800"
+        >
+          Remove “{activeCustom.label}”
+        </button>
+      )}
+
+      {/* Save any MapLibre style URL — a MapTiler one with your own key pastes
+          straight in — under a name that persists across sessions. Kept out of
+          the build so no key is baked into the deployed bundle. */}
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          if (url.trim()) pick(url.trim());
+          const u = url.trim();
+          if (!u) return;
+          const entry = saveCustomBasemap(name.trim(), u);
+          setCustoms(savedCustomBasemaps());
+          setUrl("");
+          setName("");
+          pick(entry.id);
         }}
-        className="flex gap-1"
+        className="flex flex-col gap-1"
       >
         <input
           value={url}
@@ -205,9 +244,21 @@ export default function MapControls() {
           aria-label="Custom style URL"
           className="min-w-0 flex-1 rounded-md border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-200 placeholder:text-neutral-400"
         />
-        <button className="shrink-0 rounded-md bg-neutral-800 px-2 py-1 text-xs">
-          Load
-        </button>
+        <div className="flex gap-1">
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Name (optional)"
+            aria-label="Style name"
+            className="min-w-0 flex-1 rounded-md border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-200 placeholder:text-neutral-400"
+          />
+          <button
+            disabled={!url.trim()}
+            className="shrink-0 rounded-md bg-neutral-800 px-2 py-1 text-xs disabled:opacity-40"
+          >
+            Save &amp; use
+          </button>
+        </div>
       </form>
 
       {/* The map's fill colours carry meaning the panels never spell out. A

@@ -23,7 +23,7 @@ export default function SideSheet({
   useEffect(() => setSub("idle"), [picked]);
 
   return (
-    <aside className="absolute right-0 top-0 flex h-full w-80 flex-col gap-4 overflow-y-auto border-l border-neutral-800 bg-neutral-900/95 p-5 backdrop-blur">
+    <aside className="absolute right-0 top-0 z-20 flex h-full w-80 flex-col gap-4 overflow-y-auto border-l border-neutral-700/60 bg-neutral-900/90 p-5 backdrop-blur">
       <div className="flex items-start justify-between gap-2">
         <h2 className="text-lg font-medium leading-tight">
           {info?.name ?? picked.name}

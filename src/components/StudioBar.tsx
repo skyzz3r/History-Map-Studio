@@ -106,7 +106,7 @@ export default function StudioBar({
   };
 
   return (
-    <div className="absolute inset-x-0 bottom-28 mx-6 rounded-xl border border-neutral-800 bg-neutral-900/95 p-3 backdrop-blur">
+    <div className="panel absolute inset-x-0 bottom-28 z-10 mx-6 p-3">
       {/* Two jobs live in this bar — composing the fly-through (capture, preview,
           clear) and getting a file out (still, video). Labelling and dividing
           them stops the seven controls reading as one undifferentiated row. */}

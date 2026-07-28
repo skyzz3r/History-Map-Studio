@@ -656,6 +656,39 @@ assert.deepEqual(
   "drilling into the union lists members, not enclaves",
 );
 
+// The paint guard: the reported "France empty with no fill". Geometry (on
+// tile-clipped source features) can put a country inside an empire while the
+// RENDERED empire has a hole there, so hiding the country paints nothing back.
+// A candidate is only trusted as covered when an empire fill is proven to draw
+// over its centre.
+{
+  const feats = [
+    { properties: EMPIRE, geometry: sq(0, 0, 10, 10) },
+    { properties: MEMBER, geometry: sq(1, 1, 3, 3) }, // centre ~ (2,2)
+  ];
+  assert.deepEqual(
+    coveredIds(feats, undefined, () => true),
+    [-2],
+    "covered when an empire fill is painted over it",
+  );
+  assert.deepEqual(
+    coveredIds(feats, undefined, () => false),
+    [],
+    "no empire fill behind it -> stays drawn, never an empty hole (France)",
+  );
+  // Selective: only the country an empire actually paints over is hidden.
+  const MEMBER2 = { admin_level: 2, osm_id: -8 };
+  assert.deepEqual(
+    coveredIds(
+      [...feats, { properties: MEMBER2, geometry: sq(6, 6, 8, 8) }], // centre ~ (7,7)
+      undefined,
+      (c) => c[0] < 5, // an empire fill is drawn on the left half only
+    ),
+    [-2],
+    "the unpainted candidate survives; only the painted one hides",
+  );
+}
+
 // --- one dataset at a time -------------------------------------------------
 assert.deepEqual(normaliseSources(["ohm"]), ["ohm"]);
 assert.deepEqual(
