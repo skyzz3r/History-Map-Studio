@@ -2,36 +2,45 @@ import { useEffect, useRef, useState } from "react";
 import { loadIndex, yearAt } from "./borders.ts";
 import {
   bindFocusChange,
+  currentSourceId,
   drillInto,
   drillOut,
   getFocus,
+  getScene,
   initMap,
   resetFocus,
   setEditMode,
+  setScene,
+  setSceneActive,
+  setScenePick,
   type Picked,
 } from "./map.ts";
 import { applyIndex, getIndex } from "./scrub.ts";
 import { lookup, lookupByQid, type Info } from "./wikidata.ts";
 import { cachedTags, enTitleOf, fetchTags, qidOf } from "./ohm.ts";
 import { initialFocus, type FocusState } from "./focus.ts";
+import { metaFor, onEditsChange } from "./edits.ts";
+import { toggleScene, type Scene } from "./view.ts";
 import type { Key } from "./keyframes.ts";
 import Timeline from "./components/Timeline.tsx";
-import SideSheet from "./components/SideSheet.tsx";
-import StudioBar from "./components/StudioBar.tsx";
-import MapControls from "./components/MapControls.tsx";
-import HierarchyPanel from "./components/HierarchyPanel.tsx";
+import TopBar, { type Mode } from "./components/TopBar.tsx";
+import RightRail from "./components/RightRail.tsx";
+import DetailCard from "./components/DetailCard.tsx";
+import Legend from "./components/Legend.tsx";
+import SettingsPanel from "./components/SettingsPanel.tsx";
+import StudioPanel from "./components/StudioPanel.tsx";
 import EditorPanel from "./components/EditorPanel.tsx";
 
-/** One explicit mode instead of three booleans that used to combine into a
- *  screenful of overlapping panels. Exactly one mode panel is docked at a time. */
-type Mode = "explore" | "studio" | "edit";
-
-const MODES: { id: Mode; label: string; title: string }[] = [
-  { id: "explore", label: "Explore", title: "Browse the map and drill the territory hierarchy" },
-  { id: "studio", label: "Studio", title: "Capture camera keyframes and render a fly-through video" },
-  { id: "edit", label: "Edit", title: "Correct a region’s dates, level or parent — saved in this browser" },
-];
-
+/**
+ * The screen is divided, not layered.
+ *
+ * Every panel owns an edge and nothing floats over anything else: the top bar
+ * spans the width, the sidebar is a docked column on the right, the mode panel
+ * is a card on the left, and the timeline runs along the bottom between them.
+ * Two CSS variables carry the two variable widths — `--rail` for the sidebar
+ * and `--tl` for the timeline — so the legend, the scale bar and the
+ * attribution can all be laid out against them instead of guessing.
+ */
 export default function App() {
   const container = useRef<HTMLDivElement>(null);
   const [count, setCount] = useState(0);
@@ -42,11 +51,27 @@ export default function App() {
   const [info, setInfo] = useState<Info | null>(null);
   const [mode, setMode] = useState<Mode>("explore");
   const [railOpen, setRailOpen] = useState(true);
+  /** The sidebar's hierarchy disclosure, held here so the detail card's
+   *  "Show hierarchy" can open it as well as the header inside the rail. */
+  const [hierOpen, setHierOpen] = useState(true);
+  const [tlShrunk, setTlShrunk] = useState(false);
+  const [settings, setSettings] = useState(false);
   const [keys, setKeys] = useState<Key[]>([]);
   const [focus, setFocus] = useState<FocusState>(initialFocus);
-  /** What the editor is editing. Separate from `picked`, which drives the side
-   *  sheet — in edit mode a click means "edit this", not "tell me about this". */
+  const [scene, setSceneState] = useState<Scene>(getScene);
+  /** What the editor is editing. Separate from `picked`, which drives the
+   *  detail card — in edit mode a click means "edit this", not "tell me about
+   *  this". */
   const [editing, setEditing] = useState<Picked | null>(null);
+  /** Bumped on any edit, so the detail card re-reads the user's corrections
+   *  the moment they are saved instead of on the next click. */
+  const [editRev, setEditRev] = useState(0);
+  useEffect(() => onEditsChange(() => setEditRev((n) => n + 1)), []);
+  /** The last Studio click, so a region card can be prefilled and anchored. */
+  const [studioPick, setStudioPick] = useState<{
+    p: Picked | null;
+    at: [number, number] | null;
+  }>({ p: null, at: null });
 
   /** Clearing the selection returns to the top of the hierarchy. */
   const deselect = () => {
@@ -80,14 +105,25 @@ export default function App() {
     };
   }, []);
 
-  // Edit mode reroutes clicks in map.ts: they select a region for editing
-  // instead of opening the side sheet. Leaving it clears both, so an old
-  // selection cannot be silently saved against.
+  // Each mode reroutes what a click MEANS, in map.ts. Leaving a mode clears
+  // whatever it had armed, so an old selection cannot be silently acted on.
   useEffect(() => {
     const editing = mode === "edit";
+    const studio = mode === "studio";
     setEditMode(editing, setEditing);
+    setSceneActive(studio);
+    setScenePick(
+      studio
+        ? (p, at) => {
+            setStudioPick({ p, at });
+            // A click on empty ocean is a deselect, not a scene change.
+            if (p) setSceneState((s) => commitScene(toggleScene(s, p.osmId)));
+          }
+        : null,
+    );
     if (!editing) setEditing(null);
-    else {
+    if (!studio) setStudioPick({ p: null, at: null });
+    if (editing || studio) {
       setPicked(null);
       setOthers([]);
     }
@@ -124,121 +160,104 @@ export default function App() {
       const i = qid
         ? await lookupByQid(qid, year, picked.name, title)
         : await lookup(picked.name, year);
-      if (!stale) setInfo(i);
+      // The user's own corrections win over whatever Wikidata returned. This is
+      // the whole point of the editor's flag/arms/leader/population fields:
+      // Wikidata is often right about the modern successor state and wrong
+      // about the polity that actually existed in the year on screen.
+      if (!stale) setInfo({ ...i, ...metaFor(currentSourceId(), picked.osmId) });
     })();
     return () => {
       stale = true;
     };
-  }, [picked]);
+  }, [picked, editRev]);
 
   return (
-    <div className="relative h-dvh w-dvw overflow-hidden bg-neutral-950 text-neutral-100">
+    <div
+      className="relative h-dvh w-dvw overflow-hidden bg-neutral-950 text-neutral-100"
+      style={
+        {
+          "--rail": railOpen ? "18rem" : "0rem",
+          "--tl": tlShrunk ? "2.5rem" : "7rem",
+        } as React.CSSProperties
+      }
+    >
       {/* Sized by #map in index.css, not Tailwind — see the comment there. */}
       <div ref={container} id="map" />
 
-      {/* Top bar: mode selector on the left, map/data controls on the right. */}
-      <header className="pointer-events-none absolute inset-x-0 top-0 z-30 flex items-start gap-3 p-4">
-        <div className="pointer-events-auto flex items-center gap-3">
-          <h1 className="panel px-3 py-1.5 text-sm font-medium tracking-tight">
-            Interactive History Map
-          </h1>
-          <div
-            role="tablist"
-            aria-label="Mode"
-            className="panel flex gap-0.5 p-0.5 text-sm"
-          >
-            {MODES.map((m) => (
-              <button
-                key={m.id}
-                role="tab"
-                aria-selected={mode === m.id}
-                title={m.title}
-                onClick={() => {
-                  setMode(m.id);
-                  setRailOpen(true);
-                }}
-                className={`rounded-md px-3 py-1 ${
-                  mode === m.id
-                    ? "bg-neutral-100 font-medium text-neutral-900"
-                    : "text-neutral-300 hover:bg-neutral-800"
-                }`}
-              >
-                {m.label}
-              </button>
-            ))}
-          </div>
-          {error && (
-            <span className="rounded-lg bg-red-950/90 px-3 py-1.5 text-sm text-red-200">
-              {error}
-            </span>
-          )}
-        </div>
-        <div className="pointer-events-auto ml-auto">
-          <MapControls />
-        </div>
-      </header>
+      <TopBar
+        mode={mode}
+        onMode={setMode}
+        onSettings={() => setSettings(true)}
+        onPicked={(p) => {
+          setPicked(p);
+          setOthers([]);
+        }}
+        error={error}
+      />
 
-      {/* One left rail owns the current mode's panel — Explore→Hierarchy,
-          Edit→Editor. Studio's transport is a bottom dock (below), timeline-
-          adjacent by nature. Exactly one is ever on screen, so panels can no
-          longer stack or collide. */}
-      {mode !== "studio" && (
-        <div className="absolute bottom-28 left-4 top-20 z-10 flex items-start">
-          {railOpen ? (
-            <div className="pointer-events-auto flex max-h-full">
-              {mode === "explore" && (
-                <HierarchyPanel
-                  focus={focus}
-                  onJump={drillOut}
-                  onDrill={(n) =>
-                    void drillInto({
-                      osmId: n.osmId,
-                      name: n.name,
-                      adminLevel: n.adminLevel,
-                    })
-                  }
-                  onClose={() => setRailOpen(false)}
-                />
-              )}
-              {mode === "edit" && (
-                <EditorPanel
-                  picked={editing}
-                  onClose={() => setMode("explore")}
-                />
-              )}
-            </div>
-          ) : (
-            <button
-              onClick={() => setRailOpen(true)}
-              aria-label="Show panel"
-              className="panel pointer-events-auto px-2.5 py-1.5 text-sm text-neutral-200 hover:bg-neutral-800"
-            >
-              ☰
-            </button>
-          )}
-        </div>
-      )}
+      <RightRail
+        open={railOpen}
+        onOpen={setRailOpen}
+        hierOpen={hierOpen}
+        onHierOpen={setHierOpen}
+        focus={focus}
+      />
 
-      {mode === "studio" && (
-        <StudioBar keys={keys} setKeys={setKeys} max={count - 1} />
-      )}
+      {/* One card on the left, whatever the mode. Bounded top and bottom so it
+          can never grow under the top bar or the timeline. */}
+      <div
+        className="pointer-events-none absolute left-3 top-16 z-10 flex items-start"
+        // Stops above the scale bar, which shares this corner. 0.75rem cleared
+        // the timeline but ran straight through the scale.
+        style={{ bottom: "calc(var(--tl) + 2.25rem)" }}
+      >
+        {mode === "explore" && picked && (
+          <DetailCard
+            picked={picked}
+            info={info}
+            others={others}
+            // Swapping to an overlapped polity keeps the rest of the stack
+            // available, with the one you just left put back in it.
+            onSelect={(p) => {
+              setOthers([picked, ...others.filter((o) => o.osmId !== p.osmId)]);
+              setPicked(p);
+            }}
+            onShowHierarchy={() => {
+              setRailOpen(true);
+              setHierOpen(true);
+            }}
+            onClose={deselect}
+          />
+        )}
+        {mode === "studio" && (
+          <StudioPanel
+            keys={keys}
+            setKeys={setKeys}
+            max={count - 1}
+            scene={scene}
+            onScene={setSceneState}
+            picked={studioPick.p}
+            placeAt={studioPick.at}
+          />
+        )}
+        {mode === "edit" && (
+          <EditorPanel picked={editing} onClose={() => setMode("explore")} />
+        )}
+      </div>
 
-      <Timeline max={count - 1} />
+      {mode === "explore" && <Legend />}
 
-      {picked && mode !== "edit" && (
-        <SideSheet
-          picked={picked}
-          info={info}
-          others={others}
-          // Swapping to an overlapped polity keeps the rest of the stack
-          // available, with the one you just left put back in it.
-          onSelect={(p) => {
-            setOthers([picked, ...others.filter((o) => o.osmId !== p.osmId)]);
-            setPicked(p);
-          }}
-          onClose={deselect}
-        />
-      )}
+      <Timeline max={count - 1} shrunk={tlShrunk} onShrink={setTlShrunk} />
+
+      {settings && <SettingsPanel onClose={() => setSettings(false)} />}
     </div>
   );
+}
+
+/** Push a scene change to the map as well as to React. Written as a helper so
+ *  the functional setState above stays a pure updater with one side effect in
+ *  an obvious place. */
+function commitScene(s: Scene): Scene {
+  setScene(s);
+  return s;
 }

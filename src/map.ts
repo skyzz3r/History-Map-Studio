@@ -22,13 +22,36 @@ import {
   ohmMinZoom,
   normaliseHB,
   normaliseSources,
+  savedCustomSources,
   saveSources,
   savedSources,
+  syncCustomSources,
   type Source,
 } from "./sources.ts";
+import {
+  emptyScene,
+  labelTextExpr,
+  rankMatches,
+  savedDisplay,
+  saveDisplay,
+  sceneFilter,
+  type Display,
+  type Hit as SearchHit,
+  type Scene,
+} from "./view.ts";
+import {
+  annotFeatures,
+  cardCanvas,
+  loadAnnots,
+  onAnnotsChange,
+  primeImages,
+  visibleLayers,
+  type AnnotLayer,
+} from "./annot.ts";
+import { distinctIds, stripGeometry, stripTargets } from "./strip.ts";
 import { buildLabelPoints } from "./labels.ts";
 import { bboxArea, claimsFrom, overlappingIds, type Sample } from "./claims.ts";
-import { featureArea } from "./geo.ts";
+import { featureArea, labelPoint } from "./geo.ts";
 import {
   childIds,
   COUNTRY_LEVEL,
@@ -46,10 +69,12 @@ import {
   changesDisplay,
   editFeatures,
   excludedIds,
+  flagOverrides,
   loadEdits,
   newEditId,
   onEditsChange,
   parentOverrides,
+  setAddedGeometry,
   setOverride,
   touchEdits,
   type EditFeature,
@@ -101,6 +126,17 @@ let claims: unknown[] = [];
  * that empire now draws in place of. Recomputed on the same debounced pass.
  */
 let covered: number[] = [];
+/** Sidebar view options — fill, label parts, projection. */
+let display: Display = savedDisplay();
+/** Studio's shot list. Only enforced while Studio is the active mode. */
+let scene: Scene = emptyScene();
+let sceneOn = false;
+/** Which Studio layer's annotations are live. Exactly one at a time. */
+let annotLayer: AnnotLayer = "photo";
+
+export const getDisplay = () => display;
+export const getScene = () => scene;
+export const getAnnotLayer = () => annotLayer;
 
 export const getFocus = () => focus;
 export const bindFocusChange = (fn: (f: FocusState) => void) => {
@@ -201,19 +237,139 @@ function applyFilters() {
       ] as never);
     }
   }
-  // The edits overlay carries the same dates and hierarchy as any dataset, but
-  // never the exclusion — it IS the replacement.
+  // The edits overlay carries the same dates as any dataset, but never the
+  // exclusion — it IS the replacement.
   //
-  // And never the world-view de-duplication while editing. `covered` hides a
-  // country that an empire stands in for, and saying "this region belongs to
-  // that empire" puts the region straight into that set: assigning the Kingdom
-  // of Portugal to the Portuguese Empire excluded it from the dataset layer AND
-  // hid it here, so a parent edit looked exactly like a delete. An edit must
-  // always be visible to the person making it.
-  const fEdits = editMode ? focusFilter(focus, []) : f;
+  // And in edit mode, no hierarchy filter at all. An edit must always be
+  // visible to the person making it, and two separate parts of the focus filter
+  // were hiding one:
+  //
+  //  * `covered`: saying "this region belongs to that empire" puts it straight
+  //    into the de-duplicated set, so a parent edit looked exactly like a
+  //    delete.
+  //  * `maxLevel`: the world view draws to level 2, so a region drawn at level
+  //    3 or deeper vanished the instant it was saved — you drew it, the editor
+  //    reported success, and the map showed nothing.
+  const fEdits = editMode ? null : f;
   for (const id of EDIT_LAYERS)
-    if (map.getLayer(id)) map.setFilter(id, ["all", date, fEdits] as never);
-  if (map.getLayer("hist-label")) map.setFilter("hist-label", ["all", date, f]);
+    if (map.getLayer(id))
+      map.setFilter(id, ["all", date, ...(fEdits ? [fEdits] : [])] as never);
+
+  // The shot list is the ONE thing labels are filtered on rather than masked:
+  // a symbol layer is not something you click, so nothing is lost by removing
+  // it outright, and a name floating over ground that is not in the shot is
+  // exactly what the picker is for.
+  const sc = sceneOn ? sceneFilter(scene) : null;
+  // Same exemption as the overlay above, for the same reason: a region drawn at
+  // a level below the current view would otherwise be an unnamed amber blob.
+  const named: any = editMode ? ["any", f, isEditFeature()] : f;
+  if (map.getLayer("hist-label"))
+    map.setFilter("hist-label", ["all", date, named, ...(sc ? [sc] : [])] as never);
+}
+
+/** "Is this one of the user's own features?", as a filter clause. An explicit
+ *  id list rather than a prefix test, because an EDITED original keeps the
+ *  dataset's numeric id and only an added region carries an "edit-…" one. */
+function isEditFeature(): unknown {
+  const ids = editFeatures(editSourceId()).features.map((f) => f.properties.osm_id);
+  return ids.length
+    ? ["in", ["get", "osm_id"], ["literal", ids]]
+    : ["==", ["literal", 1], 0];
+}
+
+// ---------------------------------------------------------------------------
+// Display options
+// ---------------------------------------------------------------------------
+
+/** The fill-opacity each layer uses when fills are ON. Only the three that
+ *  differ from the shared default need an entry. */
+const FILL_OPACITY: Record<string, unknown> = {
+  "ohm-claim": 0.5,
+  "ohm-occupation": [
+    "case",
+    ["boolean", ["feature-state", "hover"], false], 0.6,
+    0.45,
+  ],
+  "edit-fill": fillOpacity(0.2),
+};
+
+/** Line opacity each layer uses when it is in the shot. */
+const LINE_OPACITY: Record<string, number> = {
+  "ohm-claim-line": 0.8,
+  "edit-line": 0.95,
+};
+
+/**
+ * Territory fill and line opacity: the colour-fill toggle and the Studio shot
+ * list, which both come down to "how visible is this layer".
+ *
+ * Zero opacity rather than a filter or a layer removal, and that is the whole
+ * point. The fills are what hover and click hit-test against, and MapLibre
+ * still returns features from a fill layer at opacity 0. Filtering the shot
+ * list out — the first version — meant that under "Nothing" there was no
+ * polygon left anywhere to click, so nothing could ever be added back IN. A
+ * mask keeps every territory selectable while showing only the chosen ones.
+ */
+function applyPaint() {
+  const sc = sceneOn ? sceneFilter(scene) : null;
+  const mask = (on: unknown) => (sc ? ["case", sc, on, 0] : on);
+  const ids = [...active().flatMap((s) => s.layers), ...EDIT_LAYERS];
+  for (const id of ids) {
+    const l = map.getLayer(id);
+    if (!l) continue;
+    // Cosmetic overlays are not territories and take no part in the shot list.
+    if (id.startsWith("today-")) continue;
+    if (l.type === "fill")
+      map.setPaintProperty(
+        id,
+        "fill-opacity",
+        mask(display.fill ? (FILL_OPACITY[id] ?? fillOpacity()) : 0) as never,
+      );
+    else if (l.type === "line")
+      map.setPaintProperty(
+        id,
+        "line-opacity",
+        mask(LINE_OPACITY[id] ?? 0.9) as never,
+      );
+  }
+}
+
+const FLAG_IMAGE: unknown = ["image", ["concat", "flag:", ["get", "osm_id"]]];
+
+function applyLabels() {
+  if (!map.getLayer("hist-label")) return;
+  map.setLayoutProperty("hist-label", "text-field", labelTextExpr(display, yearOf) as never);
+  map.setLayoutProperty(
+    "hist-label",
+    "icon-image",
+    (display.labelFlag ? FLAG_IMAGE : null) as never,
+  );
+}
+
+/** Apply and persist the sidebar's view options. */
+export function setDisplay(next: Display) {
+  const projectionChanged = next.projection !== display.projection;
+  display = next;
+  saveDisplay(display);
+  if (!map) return;
+  applyPaint();
+  applyLabels();
+  if (projectionChanged) map.setProjection({ type: display.projection });
+}
+
+/** Replace the Studio shot list. */
+export function setScene(next: Scene) {
+  scene = next;
+  applyPaint();
+  applyFilters();
+}
+
+/** Whether the shot list is enforced — Studio on, every other mode off. */
+export function setSceneActive(on: boolean) {
+  sceneOn = on;
+  if (!map) return;
+  applyPaint();
+  applyFilters();
 }
 
 const EDIT_LAYERS = ["edit-fill", "edit-line"];
@@ -304,6 +460,92 @@ function addEditLayers() {
   refreshEdits();
 }
 
+// ---------------------------------------------------------------------------
+// Studio annotations
+// ---------------------------------------------------------------------------
+
+/**
+ * Captions and cards, composited to images and drawn as map symbols.
+ *
+ * On top of everything, and deliberately outside every filter: an annotation is
+ * the user's own writing, so it must not disappear because the polity under it
+ * fell out of the date range.
+ */
+function addAnnotLayer() {
+  if (!map.getSource("hist-annot"))
+    map.addSource("hist-annot", {
+      type: "geojson",
+      data: { type: "FeatureCollection", features: [] },
+    });
+  if (map.getLayer("annot")) return;
+  map.addLayer({
+    id: "annot",
+    type: "symbol",
+    source: "hist-annot",
+    layout: {
+      "icon-image": ["image", ["concat", "annot:", ["get", "id"]]],
+      // Annotations are placed by hand, so they must never be dropped or
+      // shuffled by the collision solver the way generated labels are.
+      "icon-allow-overlap": true,
+      "icon-ignore-placement": true,
+      "icon-anchor": "center",
+    },
+  });
+}
+
+let annotRefresh: Promise<void> | null = null;
+
+/**
+ * Re-composite every annotation on the active layer and push the points.
+ *
+ * remove-then-add rather than updateImage: a card's pixel size changes the
+ * moment its text or font size does, and updateImage requires the replacement
+ * to be exactly the same dimensions.
+ */
+export function refreshAnnots(): Promise<void> {
+  if (!map?.getSource("hist-annot")) return Promise.resolve();
+  // Serialised: primeImages awaits decodes, and two overlapping passes would
+  // both remove and re-add the same image key.
+  annotRefresh = (annotRefresh ?? Promise.resolve()).then(async () => {
+    // Every VISIBLE layer draws, not only the active one. Active decides what
+    // you are editing and which kind of file Export produces; visibility is a
+    // separate switch, so a caption composed on the photo layer can stay on
+    // screen while the fly-through is built beside it.
+    const shown = visibleLayers();
+    const mine = loadAnnots().filter((a) => shown.includes(a.layer));
+    await primeImages(mine);
+    for (const a of mine) {
+      const c = cardCanvas(a);
+      const g = c?.getContext("2d");
+      if (!c || !g) continue;
+      const key = `annot:${a.id}`;
+      if (map.hasImage(key)) map.removeImage(key);
+      map.addImage(key, g.getImageData(0, 0, c.width, c.height) as never, {
+        pixelRatio: 2,
+      });
+    }
+    (map.getSource("hist-annot") as maplibregl.GeoJSONSource | undefined)?.setData(
+      annotFeatures(loadAnnots(), shown) as never,
+    );
+  });
+  return annotRefresh;
+}
+
+/** Switch between the photo and video annotation layers. */
+export function setAnnotLayer(layer: AnnotLayer) {
+  annotLayer = layer;
+  void refreshAnnots();
+}
+
+/** Armed by "Place": the next map click reports where, instead of selecting. */
+let placePick: ((at: [number, number]) => void) | null = null;
+export const armPlace = (fn: (at: [number, number]) => void) => {
+  placePick = fn;
+};
+export const disarmPlace = () => {
+  placePick = null;
+};
+
 export function setOhmDate(dec: number) {
   currentDate = dec;
   applyFilters();
@@ -331,15 +573,9 @@ const yearOf = (prop: string, fallback: string): any => [
   ["slice", ["get", prop], 0, 4],
 ];
 
-const labelText: any = [
-  "format",
-  ["coalesce", ["get", "name:en"], ["get", "name"], ""],
-  {},
-  "\n",
-  {},
-  ["concat", yearOf("start_date", "?"), "–", yearOf("end_date", "present")],
-  { "font-scale": 0.72, "text-color": "#9ca3af" },
-];
+// The text is now assembled by labelTextExpr in view.ts, because which PARTS
+// are shown (name, dates) is a sidebar toggle and "neither" has to collapse to
+// an empty string rather than a lone newline.
 
 // ---------------------------------------------------------------------------
 // Basemaps
@@ -497,10 +733,15 @@ async function addHistoryLayers() {
     // re-attach path so they survive every basemap swap — setStyle drops every
     // source and layer we own.
     addEditLayers();
+    // Last, so captions and cards sit above every border layer and every label.
+    addAnnotLayer();
     if (clip) ensureClipMask();
     applyMemberState();
+    applyPaint();
+    applyLabels();
     applyFilters();
     queueLabels();
+    void refreshAnnots();
   } finally {
     attaching = false;
   }
@@ -516,13 +757,68 @@ async function addHistoryLayers() {
  * the coast shown is the modern OSM one, not the era's (a reclaimed Zuiderzee or
  * a full Aral Sea reads as present-day).
  */
-function ensureClipMask() {
+function ensureOceanSource() {
   if (!map.getSource("hist-ocean"))
     map.addSource("hist-ocean", {
       type: "vector",
       url: BASEMAP_TILES,
       attribution: "© OpenStreetMap, Protomaps",
     } as never);
+}
+
+/**
+ * Keep the sea tiles loaded so the border strip can carve them out.
+ *
+ * A source with no layer referencing it fetches nothing, so querySourceFeatures
+ * would return an empty list and "strip oceans" would silently do nothing. An
+ * invisible fill is what makes the tiles arrive. Nothing is added when the
+ * coastline clip is already on — its mask loads the same tiles.
+ */
+export function setStripOceans(on: boolean) {
+  if (!map) return;
+  if (!on || clip) {
+    if (map.getLayer("ocean-probe")) map.removeLayer("ocean-probe");
+    return;
+  }
+  ensureOceanSource();
+  if (map.getLayer("ocean-probe")) return;
+  map.addLayer(
+    {
+      id: "ocean-probe",
+      type: "fill",
+      source: "hist-ocean",
+      "source-layer": "water",
+      paint: { "fill-opacity": 0 },
+    },
+    map.getLayer("hist-label") ? "hist-label" : undefined,
+  );
+}
+
+/**
+ * Salt water to carve out of a drawn region.
+ *
+ * queryRenderedFeatures, NOT querySourceFeatures, and the difference is the
+ * whole feature working. The source keeps parent tiles cached, so asking it for
+ * water hands back the z2 ocean as well as the z6 one — and the z2 coastline is
+ * simplified far enough inland that stripping against it deleted the LAND too
+ * (measured: a box half in the Adriatic came back 0.004 deg², all of Abruzzo
+ * gone). The rendered set is only the tiles actually being drawn at this zoom,
+ * which is the coastline the user can see.
+ *
+ * Lakes and rivers are excluded by OCEAN_KINDS, the same rule the coastline
+ * clip uses, so a Great-Lakes border is never treated as sea.
+ */
+function oceanFeatures(): { properties: any; geometry: any }[] {
+  const layer = ["ocean-mask", "ocean-probe"].find((l) => map.getLayer(l));
+  if (!layer) return [];
+  return map
+    .queryRenderedFeatures({ layers: [layer] })
+    .filter((f) => OCEAN_KINDS.includes(String(f.properties?.kind)))
+    .map((f, i) => ({ properties: { osm_id: `sea-${i}` }, geometry: f.geometry }));
+}
+
+function ensureClipMask() {
+  ensureOceanSource();
 
   if (map.getLayer("ocean-mask")) return;
   // Seamless where the basemap draws water; a dark sea elsewhere (None/OHM).
@@ -599,7 +895,7 @@ function addLabelLayer() {
     type: "symbol",
     source: "hist-labels",
     layout: {
-      "text-field": labelText,
+      "text-field": labelTextExpr(display, yearOf) as never,
       // Noto Sans Bold is NOT in the Protomaps glyph set; it 404s. Medium is.
       "text-font": ["Noto Sans Medium"],
       "text-size": ["interpolate", ["linear"], ["zoom"], 2, 10, 10, 15],
@@ -612,7 +908,7 @@ function addLabelLayer() {
       "symbol-sort-key": ["-", 0, ["coalesce", ["get", "area"], 0]],
       // Flags are registered lazily as "flag:<osm_id>"; ["image"] resolves to
       // null when one is missing, so the label degrades to text-only.
-      "icon-image": ["image", ["concat", "flag:", ["get", "osm_id"]]],
+      "icon-image": (display.labelFlag ? FLAG_IMAGE : null) as never,
       "icon-size": ["interpolate", ["linear"], ["zoom"], 2, 0.4, 10, 0.85],
       // Flag sits above the block; the text hangs off the icon's bottom edge.
       "icon-anchor": "bottom",
@@ -647,8 +943,23 @@ export async function setSources(ids: string[]) {
     for (const l of s.layers) if (map.getLayer(l)) map.removeLayer(l);
     // Drop the source too, so re-enabling rebuilds it from scratch instead of
     // adopting a stale one. Layers must go first or MapLibre refuses.
-    if (SRC_ID[s.id] && map.getSource(SRC_ID[s.id])) map.removeSource(SRC_ID[s.id]);
+    const sid = srcIdOf(s.id);
+    if (map.getSource(sid)) map.removeSource(sid);
   }
+
+  // A user-added dataset that has just been DELETED is no longer in SOURCES, so
+  // the loop above cannot find its layers to take down — they stayed attached
+  // and kept drawing a dataset the settings panel said was gone. Sweep those by
+  // source id instead of by registration.
+  const live = new Set(
+    SOURCES.filter((s) => enabled.includes(s.id)).map((s) => srcIdOf(s.id)),
+  );
+  const orphan = (sid: unknown) =>
+    typeof sid === "string" && sid.startsWith("hist-src-") && !live.has(sid);
+  for (const l of map.getStyle().layers)
+    if (orphan((l as { source?: unknown }).source)) map.removeLayer(l.id);
+  for (const sid of Object.keys(map.getStyle().sources))
+    if (orphan(sid)) map.removeSource(sid);
 
   for (const s of SOURCES) {
     if (!enabled.includes(s.id)) continue;
@@ -682,6 +993,10 @@ export async function initMap(
   onPick: (p: Picked | null, others: Picked[]) => void,
 ): Promise<maplibregl.Map> {
   maplibregl.addProtocol("pmtiles", new Protocol().tile);
+  // Before savedSources(): normaliseSources drops any id it does not recognise,
+  // so a user-added dataset saved as the active one would silently revert to
+  // OHM on every reload if its Source did not exist yet.
+  syncCustomSources();
   enabled = savedSources();
   await detectOhm();
 
@@ -700,6 +1015,10 @@ export async function initMap(
   // native handler on made it zoom first, so by the time the drill read the
   // cursor it was over a city district rather than the country.
   map.doubleClickZoom.disable();
+
+  // The bottom-left scale bar. MapLibre ships one that already tracks zoom and
+  // latitude, so there is nothing here to compute or keep in sync.
+  map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left");
 
   // Without this, a bad style or tile URL fails completely silently.
   map.on("error", (e) => console.error("maplibre:", e.error?.message ?? e));
@@ -720,6 +1039,9 @@ export async function initMap(
   map.on("sourcedata", (e) => {
     if (e.sourceId !== "hist-labels") queueLabels();
   });
+
+  if (display.projection !== "mercator")
+    map.setProjection({ type: display.projection });
 
   const saved = savedBasemap();
   if (saved !== "dark") setBasemap(saved);
@@ -766,6 +1088,22 @@ const SRC_ID: Record<string, string> = {
   cshapes: "hist-cs",
   today: "hist-today",
 };
+
+/** MapLibre source behind a layer, for the built-ins and for user-added
+ *  datasets alike — those name their layers "<sourceId>-fill" / "-line". */
+function srcOf(layer: string): [string, string | undefined] | [] {
+  const hit = SRC_OF[layer];
+  if (hit) return hit;
+  const sid = layer.replace(/-(fill|line)$/, "");
+  const c = savedCustomSources().find((x) => x.id === sid);
+  if (!c) return [];
+  return [
+    `hist-${sid}`,
+    c.kind === "vector" ? (c.sourceLayer ?? "boundaries") : undefined,
+  ];
+}
+
+const srcIdOf = (id: string) => SRC_ID[id] ?? `hist-${id}`;
 
 /**
  * The clicked polity, highlighted on the map.
@@ -885,14 +1223,14 @@ function setGroupState(
 
 function setSelected(hit: Hit | null) {
   if (picked) {
-    const [src, sl] = SRC_OF[picked.layer] ?? [];
+    const [src, sl] = srcOf(picked.layer);
     if (src) map.setFeatureState(stateRef(src, sl, picked.id), { selected: false });
   }
   if (pickedGroup.length) setGroupState(pickedGroup, "selected", false);
   pickedGroup = [];
   picked = null;
   if (!hit || hit.f.id === undefined) return;
-  const [src, sl] = SRC_OF[hit.layer] ?? [];
+  const [src, sl] = srcOf(hit.layer);
   if (!src) return;
   picked = { layer: hit.layer, id: hit.f.id };
   map.setFeatureState(stateRef(src, sl, hit.f.id), { selected: true });
@@ -911,7 +1249,7 @@ function bindHover() {
   let hotGroup: (string | number)[] = [];
   const clear = () => {
     if (hot) {
-      const [src, sl] = SRC_OF[hot.layer] ?? [];
+      const [src, sl] = srcOf(hot.layer);
       if (src) map.setFeatureState(stateRef(src, sl, hot.id), { hover: false });
     }
     if (hotGroup.length) setGroupState(hotGroup, "hover", false);
@@ -928,7 +1266,7 @@ function bindHover() {
     }
     if (hot && hot.id === hit.f.id && hot.layer === hit.layer) return;
     clear();
-    const [src, sl] = SRC_OF[hit.layer] ?? [];
+    const [src, sl] = srcOf(hit.layer);
     if (src) {
       hot = { layer: hit.layer, id: hit.f.id };
       map.setFeatureState(stateRef(src, sl, hit.f.id), { hover: true });
@@ -1062,10 +1400,28 @@ const onKeyDown = (e: KeyboardEvent) => {
 
 function bindClick(onPick: (p: Picked | null, others: Picked[]) => void) {
   map.on("click", (e) => {
+    // Placing an annotation consumes the click outright: it is about a spot on
+    // the map, not about whatever polity happens to be under it.
+    if (placePick) {
+      const fn = placePick;
+      placePick = null;
+      return fn([e.lngLat.lng, e.lngLat.lat]);
+    }
+
     // The whole stack, not only the winner. Where two polities genuinely
     // overlap — a de-facto occupier and the de-jure claimant it displaced —
     // the loser was previously unreachable by any click at all.
     const hits = hitsAt(e.point).filter((h) => h.f.properties);
+
+    // Studio: a click is "put this in the shot" / "take it out". The selection
+    // highlight still moves, so it is obvious which one just changed.
+    if (scenePick) {
+      setSelected(hits[0] ?? null);
+      return scenePick(hits[0] ? toPicked(hits[0].f.properties!) : null, [
+        e.lngLat.lng,
+        e.lngLat.lat,
+      ]);
+    }
 
     // "Pick parent" consumes exactly one click and must not also change the
     // selection, or choosing a parent would navigate away from the child whose
@@ -1313,7 +1669,7 @@ function childrenOf(
 function sourceFeatures(): maplibregl.GeoJSONFeature[] | null {
   const s = pickable()[0];
   if (!s) return null;
-  const [srcId, sourceLayer] = SRC_OF[s.pickLayer] ?? [];
+  const [srcId, sourceLayer] = srcOf(s.pickLayer);
   if (!srcId || !map.getSource(srcId)) return null;
   const base = map.querySourceFeatures(srcId, {
     sourceLayer,
@@ -1498,8 +1854,40 @@ let flagsInFlight = 0;
  * carry them), one Wikidata fetch per Q-id for the filename, and one Commons
  * call turning all of those into CORS-readable thumbnail URLs.
  */
+/**
+ * Flags the USER supplied, registered under the same `flag:<osm_id>` key the
+ * label layer already reads.
+ *
+ * Registered before the Wikidata pass and marked `asked`, so a corrected flag is
+ * never quietly replaced by whatever Commons happens to hold. Keyed on the URL
+ * so re-running this is free until the picture actually changes.
+ */
+const flagUrlOf = new Map<string, string>();
+
+async function applyFlagOverrides() {
+  if (!map?.getLayer("hist-label")) return;
+  for (const [id, url] of flagOverrides(currentSourceId())) {
+    const key = `flag:${id}`;
+    if (flagUrlOf.get(key) === url) continue;
+    flagUrlOf.set(key, url);
+    const n = Number(id);
+    if (Number.isFinite(n)) asked.add(n); // keep the Wikidata pass off it
+    try {
+      const bitmap = await createImageBitmap(await (await fetch(url)).blob());
+      if (map.hasImage(key)) map.removeImage(key);
+      map.addImage(key, bitmap);
+    } catch {
+      // A remote URL that blocks CORS cannot become a map icon (a Commons
+      // Special:FilePath link is the usual case — its 302 sends no headers).
+      // The detail card still shows it; the map falls back to text-only.
+      flagUrlOf.delete(key);
+    }
+  }
+}
+
 async function loadFlags() {
   if (!map.getLayer("hist-label")) return;
+  await applyFlagOverrides();
   const feats = map
     .queryRenderedFeatures({ layers: ["hist-label"] })
     .filter(
@@ -1568,10 +1956,63 @@ export function setCoarse(data: unknown) {
   queueLabels();
 }
 
-/** Globe or flat. MapLibre 5 only — and only safe now that deck.gl is gone. */
-export function setGlobe(on: boolean) {
-  map.setProjection({ type: on ? "globe" : "mercator" });
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+/**
+ * Name search over the active dataset.
+ *
+ * ponytail: searches the tiles currently LOADED, which at the world view is
+ * every country and at a city zoom is only what is on screen. Upgrade path is
+ * an OHM Nominatim call; the offline answer is good enough that adding a
+ * network round trip to every keystroke would be the worse trade.
+ */
+export function searchPolities(q: string, limit = 8): SearchHit[] {
+  const feats = sourceFeatures() ?? [];
+  const items: SearchHit[] = [];
+  for (const f of feats) {
+    const p = f.properties ?? {};
+    const name = String(p["name:en"] || p.name || "");
+    if (!name || p.osm_id === undefined) continue;
+    items.push({
+      id: p.osm_id,
+      name,
+      level: Number(p.admin_level) || 9,
+    });
+  }
+  return rankMatches(q, items, limit);
 }
+
+/**
+ * Frame a polity by id and select it. Returns what to show in the detail card,
+ * or null when it is no longer in the loaded tiles (the timeline moved past it).
+ */
+export async function gotoPolity(id: string | number): Promise<Picked | null> {
+  const want = String(id);
+  const feats = (sourceFeatures() ?? []).filter(
+    (f) => String(f.properties?.osm_id) === want,
+  );
+  if (!feats.length) return null;
+
+  // Overpass bounds frame the WHOLE polity; the loaded tiles only know the part
+  // that happens to be on screen, so they are the fallback rather than the plan.
+  const nid = numericId(id);
+  if (nid !== null) await fetchTags([nid]);
+  const b = nid === null ? undefined : cachedBounds(nid);
+  if (b) fitTo(b);
+  else {
+    const at = feats.map((f) => labelPointOf(f.geometry)).find(Boolean);
+    if (at) map.easeTo({ center: at, zoom: Math.max(map.getZoom(), 4), duration: 700 });
+  }
+
+  const props = feats[0].properties!;
+  setSelected({ layer: pickable()[0]?.pickLayer ?? "ohm-fill", source: null as never, f: feats[0] as never });
+  return toPicked(props);
+}
+
+const labelPointOf = (g: unknown): [number, number] | null =>
+  (g ? (labelPoint(g) ?? null)?.at ?? null : null);
 
 // ---------------------------------------------------------------------------
 // Editor
@@ -1584,6 +2025,14 @@ let editMode = false;
 let onEditPick: ((p: Picked | null) => void) | null = null;
 /** Armed by "Pick parent": the next click reports a polity instead of selecting. */
 let parentPick: ((p: Picked) => void) | null = null;
+/** Set while Studio is open: a click adds to or removes from the shot list.
+ *  Carries the clicked point too, so a card can be anchored where you clicked. */
+type ScenePick = (p: Picked | null, at: [number, number]) => void;
+let scenePick: ScenePick | null = null;
+
+export function setScenePick(fn: ScenePick | null) {
+  scenePick = fn;
+}
 
 export function setEditMode(on: boolean, pick?: (p: Picked | null) => void) {
   editMode = on;
@@ -1614,7 +2063,7 @@ export const disarmParentPick = () => {
 export function geometryOf(osmId: string | number): unknown | null {
   const s = pickable()[0];
   if (!s) return null;
-  const [srcId, sourceLayer] = SRC_OF[s.pickLayer] ?? [];
+  const [srcId, sourceLayer] = srcOf(s.pickLayer);
   if (!srcId || !map.getSource(srcId)) return null;
   const want = String(osmId);
   const polys: unknown[] = [];
@@ -1665,9 +2114,63 @@ export function saveEdit(
  * stored immediately so a half-filled region is still visible and editable
  * rather than being lost if the panel closes.
  */
-export async function drawRegion(): Promise<string | null> {
-  const geometry = await startPolygon(map);
-  if (!geometry) return null;
+export type DrawOpts = {
+  /** Hierarchy level chosen BEFORE drawing — it decides what gets stripped. */
+  level: number;
+  /** The polity this one sits inside, if any. Never stripped from the result. */
+  parent?: string | number;
+  /** Carve existing territory out of the drawn shape. */
+  strip: boolean;
+  /** Carve the sea out too, so the result stops at the coastline. */
+  oceans?: boolean;
+};
+
+/**
+ * Everything a drawn shape is carved against: neighbouring territory, and
+ * optionally the sea.
+ *
+ * The wait guards the sea only. Water tiles are fetched the moment the option
+ * is armed, so a draw that starts immediately after can find MapLibre still
+ * showing parent tiles as placeholders — and a low-zoom coastline is simplified
+ * far enough inland to swallow whole provinces. Waiting costs nothing once the
+ * tiles are in, which after a few clicks they normally are.
+ */
+async function stripSet(
+  level: number,
+  parent?: string | number,
+  oceans?: boolean,
+  self?: string | number,
+) {
+  if (oceans) await whenIdle();
+  const land = stripTargets(sourceFeatures() ?? [], level, parent, self);
+  return oceans ? [...land, ...oceanFeatures()] : land;
+}
+
+export type DrawResult =
+  /** Saved. `stripped` is how many existing regions were carved out. */
+  | { id: string; stripped: number }
+  /** The drawn area was entirely claimed already; nothing was saved. */
+  | { id: null; stripped: number; empty: true };
+
+export async function drawRegion(opts: DrawOpts): Promise<DrawResult | null> {
+  const raw = await startPolygon(map);
+  if (!raw) return null;
+
+  let geometry: unknown = raw;
+  let stripped = 0;
+  if (opts.strip) {
+    const targets = await stripSet(opts.level, opts.parent, opts.oceans);
+    // Sea polygons are not "regions" and must not be counted as such — the
+    // editor reports how many existing STATES were carved out.
+    stripped = distinctIds(targets.filter((f) => !String(f.properties?.osm_id).startsWith("sea-")));
+    const cut = stripGeometry(raw, targets);
+    // Nothing left means every square metre drawn already belongs to somebody.
+    // Saying so beats saving an empty geometry, which renders as nothing and is
+    // indistinguishable from the editor silently failing.
+    if (!cut) return { id: null, stripped, empty: true };
+    geometry = cut;
+  }
+
   const src = currentSourceId();
   const doc = loadEdits()[src];
   const id = newEditId(src, (doc?.added.length ?? 0) + 1);
@@ -1677,12 +2180,42 @@ export async function drawRegion(): Promise<string | null> {
     properties: {
       osm_id: id,
       name: "New region",
-      admin_level: COUNTRY_LEVEL,
+      admin_level: opts.level || COUNTRY_LEVEL,
+      ...(opts.parent === undefined ? {} : { parent: opts.parent }),
     },
   };
   addFeature(src, feat);
-  return id;
+  return { id, stripped };
 }
+
+/**
+ * Re-run the strip on a region the user already drew — for switching the option
+ * on after the fact, or re-applying it once the neighbours it should be carved
+ * against have actually loaded.
+ *
+ * Returns how many regions were carved out, or null when the id is not one of
+ * the user's own regions or nothing would be left of it.
+ */
+export async function restripRegion(
+  osmId: string | number,
+  level: number,
+  parent?: string | number,
+  oceans?: boolean,
+): Promise<number | null> {
+  const src = currentSourceId();
+  const feat = loadEdits()[src]?.added.find(
+    (f) => String(f.properties.osm_id) === String(osmId),
+  );
+  if (!feat?.geometry) return null;
+  const targets = await stripSet(level, parent, oceans, osmId);
+  const cut = stripGeometry(feat.geometry, targets);
+  if (!cut) return null;
+  setAddedGeometry(src, osmId, cut);
+  return distinctIds(targets.filter((f) => !String(f.properties?.osm_id).startsWith("sea-")));
+}
+
+// Re-composite whenever an annotation is added, edited or removed.
+onAnnotsChange(() => void refreshAnnots());
 
 // Re-render whenever the edit set changes, from anywhere.
 onEditsChange(() => {

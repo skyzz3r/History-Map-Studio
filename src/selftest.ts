@@ -3,7 +3,7 @@
 // Run: npm test
 import assert from "node:assert/strict";
 import { lerpBearing, sampleCamera, type Key } from "./keyframes.ts";
-import { activeAt, wdYear } from "./wikidata.ts";
+import { activeAt, wdYear, wikiTitle } from "./wikidata.ts";
 import { enTitleOf, parseBounds, parseOverpass, qidOf } from "./ohm.ts";
 import { toDecimalYear, toInputDate } from "./dates.ts";
 import {
@@ -42,6 +42,37 @@ import {
   yearNum,
 } from "./edits.ts";
 import { closeRing } from "./draw.ts";
+import {
+  emptyScene,
+  inScene,
+  labelTextExpr,
+  rankMatches,
+  sceneFilter,
+  setSceneMode,
+  toggleScene,
+} from "./view.ts";
+import {
+  bboxOf,
+  boxesOverlap,
+  distinctIds,
+  nearBox,
+  stripGeometry,
+  stripTargets,
+} from "./strip.ts";
+import {
+  FAN_CAP,
+  hierTree,
+  layout,
+  leafCount,
+  polar,
+  radialLink,
+  ribbonPath,
+  wedgePath,
+} from "./hier.ts";
+import { annotFeatures, newAnnot, wrapLines } from "./annot.ts";
+import { normaliseCustom } from "./sources.ts";
+import { niceStep } from "./borders.ts";
+import { parseWhen } from "./dates.ts";
 // The tile pipeline is plain .mjs so CI can run it with no bundler; it has no
 // types. Tested here anyway — its id signing is the one thing that can produce
 // tiles that look perfectly healthy and resolve nothing.
@@ -868,5 +899,345 @@ assert.deepEqual(
 );
 assert.equal(named.counts.get(4), 2);
 assert.equal(named.counts.size, 1, "the maritime line formed no tier of its own");
+
+// ===========================================================================
+// The redesign: view options, the Studio scene, search, the strip, the
+// hierarchy diagrams, annotations, and the new date box.
+// ===========================================================================
+
+// --- labelTextExpr: "neither part" must be EMPTY, not a bare newline --------
+const yr = (p: string, f: string) => ["yr", p, f];
+const both = labelTextExpr({ labelName: true, labelDates: true }, yr) as any[];
+assert.equal(both[0], "format");
+assert.ok(
+  JSON.stringify(both).includes("\\n"),
+  "name and dates are two lines",
+);
+assert.deepEqual(
+  labelTextExpr({ labelName: false, labelDates: false }, yr),
+  "",
+  "both off collapses to an empty string, not a newline that still collides",
+);
+assert.ok(
+  !JSON.stringify(labelTextExpr({ labelName: true, labelDates: false }, yr)).includes("yr"),
+  "dates off drops the date expression entirely",
+);
+assert.ok(
+  !JSON.stringify(labelTextExpr({ labelName: false, labelDates: true }, yr)).includes("name:en"),
+  "name off drops the name expression entirely",
+);
+
+// --- Scene: the exception list, and the filter it produces ------------------
+const s0 = emptyScene();
+assert.equal(sceneFilter(s0), null, "an untouched 'everything' needs no filter");
+assert.equal(inScene(s0, 42), true);
+
+const s1 = toggleScene(s0, 42);
+assert.deepEqual(s1.ids, ["42"]);
+assert.equal(inScene(s1, 42), false, "'everything' + an id means that id is OUT");
+assert.deepEqual(toggleScene(s1, 42).ids, [], "toggling again puts it back");
+const sf1 = sceneFilter(s1) as any[];
+assert.equal(sf1[0], "!", "under 'everything' the named ids are excluded");
+assert.deepEqual(sf1[1][2][1], [42], "ids go in numeric so they match tile osm_id");
+
+const s2 = toggleScene(setSceneMode(s0, "none"), "hb-3");
+assert.equal(inScene(s2, "hb-3"), true, "'nothing' + an id means that id is IN");
+assert.equal(inScene(s2, 42), false);
+assert.equal((sceneFilter(s2) as any[])[0], "in", "under 'nothing' the named ids are the whole set");
+assert.deepEqual((sceneFilter(s2) as any[])[2][1], ["hb-3"], "a non-numeric id stays a string");
+// "Nothing, and nothing named yet" must hide everything — returning null there
+// would silently mean "show the world" the moment you pressed Nothing.
+assert.notEqual(sceneFilter(setSceneMode(s0, "none")), null);
+assert.deepEqual(setSceneMode(s1, "all"), s1, "re-picking the current base is a no-op");
+
+// --- rankMatches -----------------------------------------------------------
+const places = [
+  { id: 1, name: "Francheville", level: 8 },
+  { id: 2, name: "France", level: 2 },
+  { id: 3, name: "Franconia", level: 3 },
+  { id: 4, name: "Kingdom of France", level: 2 },
+  { id: 5, name: "Württemberg", level: 3 },
+  { id: 2, name: "France (duplicate id)", level: 2 },
+];
+assert.deepEqual(
+  rankMatches("fran", places).map((h) => h.name),
+  ["France", "Franconia", "Francheville", "Kingdom of France"],
+  "prefix beats substring, then shallower level, then shorter name",
+);
+assert.deepEqual(
+  rankMatches("wurttemberg", places).map((h) => h.id),
+  [5],
+  "diacritics are folded, so an ASCII query finds Württemberg",
+);
+assert.deepEqual(
+  rankMatches("preussisch", [{ id: 9, name: "Preußisch Eylau", level: 6 }]).map((h) => h.id),
+  [9],
+  "eszett folds to ss — NFD alone leaves it, and every Prussian district is spelled with one",
+);
+assert.deepEqual(
+  rankMatches("kobenhavn", [{ id: 9, name: "København", level: 4 }]).map((h) => h.id),
+  [9],
+  "slashed o folds too; it is a letter, not an accent",
+);
+assert.equal(rankMatches("", places).length, 0, "an empty query matches nothing");
+assert.equal(rankMatches("fran", places, 2).length, 2, "the limit is honoured");
+assert.equal(
+  rankMatches("france", places).filter((h) => h.id === 2).length,
+  1,
+  "one entry per id, however many tile pieces carried the name",
+);
+
+// --- stripTargets: which regions a new border is carved out of --------------
+const lvl = (id: number, l: number, box: [number, number, number, number]) => ({
+  properties: { osm_id: id, admin_level: l },
+  geometry: sq(box[0], box[1], box[2], box[3]),
+});
+const nbrs = [
+  lvl(100, 1, [0, 0, 100, 100]), // the parent empire
+  lvl(101, 1, [200, 200, 300, 300]), // a RIVAL empire, elsewhere
+  lvl(200, 2, [10, 10, 20, 20]), // a neighbouring country
+  lvl(300, 3, [11, 11, 12, 12]), // a province inside that country
+  lvl(400, 2, [30, 30, 40, 40]), // the region being drawn/edited
+];
+const carve = stripTargets(nbrs, 2, 100, 400).map((f) => f.properties.osm_id);
+assert.deepEqual(
+  carve.sort((a, b) => a - b),
+  [101, 200],
+  "same level and rival empires are stripped; the parent, its ancestors and deeper subdivisions are not",
+);
+assert.ok(!carve.includes(100), "the chosen parent is never stripped");
+assert.ok(!carve.includes(300), "a subdivision inside the new region is kept, not carved out");
+assert.ok(!carve.includes(400), "a region is never stripped from itself");
+assert.deepEqual(
+  stripTargets(nbrs, 2).map((f) => f.properties.osm_id).sort((a, b) => a - b),
+  [100, 101, 200, 400],
+  "with no parent named, every same-or-higher region qualifies",
+);
+// The ancestor rule is geometric: an empire that CONTAINS the parent contains
+// the new region too, so stripping it would delete the whole shape.
+const nested = [
+  lvl(1, 1, [0, 0, 100, 100]), // grandparent empire
+  lvl(2, 2, [10, 10, 50, 50]), // the parent country, inside it
+  lvl(3, 3, [60, 60, 70, 70]), // an unrelated region at the new level
+];
+assert.deepEqual(
+  stripTargets(nested, 3, 2).map((f) => f.properties.osm_id),
+  [3],
+  "the parent's own ancestors are spared, or the new region is carved to nothing",
+);
+
+// --- stripGeometry ---------------------------------------------------------
+const drawn = sq(0, 0, 10, 10);
+assert.equal(
+  featureArea(stripGeometry(drawn, [])),
+  100,
+  "nothing to strip returns the shape untouched",
+);
+const cut = stripGeometry(drawn, [{ properties: {}, geometry: sq(5, -1, 11, 11) }]);
+assert.equal(featureArea(cut), 50, "half the square is carved away");
+assert.equal(
+  stripGeometry(drawn, [{ properties: {}, geometry: sq(-1, -1, 11, 11) }]),
+  null,
+  "an entirely claimed area yields null, not an empty polygon that renders as nothing",
+);
+// Two disjoint bites make a MultiPolygon, which the overlay must still accept.
+const split = stripGeometry(drawn, [
+  { properties: {}, geometry: sq(4, -1, 6, 11) },
+]) as any;
+assert.equal(split.type, "MultiPolygon");
+assert.equal(featureArea(split), 80);
+assert.equal(distinctIds([lvl(1, 2, [0, 0, 1, 1]), lvl(1, 2, [2, 2, 3, 3])]), 1,
+  "tile pieces of one region count once");
+
+// --- hierTree + layout -----------------------------------------------------
+const focusAt: FocusState = {
+  trail: [
+    { osmId: 1, name: "British Empire", adminLevel: 1 },
+    { osmId: 2, name: "India", adminLevel: 2 },
+  ],
+  maxLevel: 4,
+  allow: [],
+  children: [
+    { osmId: 10, name: "Bengal", adminLevel: 3 },
+    { osmId: 11, name: "Madras", adminLevel: 3 },
+    { osmId: 12, name: "Bombay", adminLevel: 3 },
+  ],
+  resolved: true,
+};
+const tree = hierTree(focusAt);
+assert.equal(tree.name, "World");
+assert.equal(tree.children[0].name, "British Empire");
+assert.equal(tree.children[0].children[0].name, "India");
+assert.equal(tree.children[0].children[0].kind, "tip");
+assert.equal(tree.children[0].children[0].children.length, 3);
+assert.equal(leafCount(tree, new Set()), 3);
+assert.equal(leafCount(tree, new Set(["world"])), 1, "collapsing the root leaves one leaf");
+assert.equal(
+  hierTree({ ...focusAt, children: Array.from({ length: 40 }, (_, i) => ({ osmId: i, name: `p${i}`, adminLevel: 3 })) })
+    .children[0].children[0].children.length,
+  FAN_CAP,
+  "the fan is capped so a 40-way sunburst is not a grey disc",
+);
+
+const lay = layout(tree);
+assert.equal(lay.maxDepth, 3);
+assert.deepEqual([lay.rows[0].a0, lay.rows[0].a1], [0, 1], "the root spans everything");
+const leaves = lay.rows.filter((r) => !r.node.children.length);
+assert.equal(leaves.length, 3);
+// Siblings must partition their parent exactly, or the three diagrams disagree
+// about how wide the same node is.
+assert.equal(leaves[0].a0, 0);
+assert.ok(Math.abs(leaves[2].a1 - 1) < 1e-9);
+for (let i = 1; i < leaves.length; i++)
+  assert.ok(Math.abs(leaves[i].a0 - leaves[i - 1].a1) < 1e-9, "no gap between siblings");
+assert.equal(layout(tree, new Set(["world"])).rows.length, 1, "a collapsed root hides its branch");
+
+// --- SVG path maths --------------------------------------------------------
+const [px, py] = polar(0, 0, 10, 0);
+assert.ok(Math.abs(px) < 1e-9 && Math.abs(py + 10) < 1e-9, "0 turns is 12 o'clock");
+const [qx, qy] = polar(0, 0, 10, 0.25);
+assert.ok(Math.abs(qx - 10) < 1e-9 && Math.abs(qy) < 1e-9, "a quarter turn is clockwise to 3 o'clock");
+// The large-arc flag is why a lone child fills its ring instead of drawing as a
+// sliver of the circle it in fact owns entirely.
+assert.match(wedgePath(0, 0, 5, 10, 0, 1), / 1 1 /, "a full ring uses the large-arc flag");
+assert.match(wedgePath(0, 0, 5, 10, 0, 0.25), / 0 1 /, "a quarter does not");
+assert.ok(wedgePath(0, 0, 0, 10, 0, 0.5).includes("L0 0"), "an inner radius of 0 closes through the centre");
+assert.ok(ribbonPath(0, 10, 0, 5, 2, 7).startsWith("M0 0"), "a ribbon starts at the parent edge");
+assert.ok(radialLink(0, 0, 0, 0, 10, 0.5).startsWith("M0 0"), "a link starts at the parent node");
+
+// --- parseWhen: one box that can express BC ---------------------------------
+assert.equal(parseWhen("1815"), 1815);
+assert.equal(parseWhen("44 BC"), -44);
+assert.equal(parseWhen("44bce"), -44);
+assert.equal(parseWhen("AD 800"), 800);
+assert.equal(parseWhen("-0044"), -44, "the ISO signed form works too");
+assert.ok(Math.abs(parseWhen("1815-06-18")! - 1815.4602739726) < 1e-6);
+assert.equal(parseWhen(""), null);
+assert.equal(parseWhen("Waterloo"), null);
+assert.equal(parseWhen("12 apples"), null, "a number with trailing junk is not a year");
+
+// --- niceStep: labels land on years a person would name ---------------------
+assert.equal(niceStep(80), 10);
+assert.equal(niceStep(40), 5);
+assert.equal(niceStep(8), 1);
+assert.equal(niceStep(2), 1, "never below a year — the data has no finer structure");
+assert.equal(niceStep(800), 100);
+assert.equal(niceStep(2000), 500, "the 1/2/5 ladder rounds up, so 2000 years steps by 500");
+
+// --- annotations -----------------------------------------------------------
+assert.deepEqual(wrapLines("one two three four", 9), ["one two", "three", "four"]);
+assert.deepEqual(wrapLines("", 10), [""], "an empty caption is one empty line, not zero");
+assert.deepEqual(
+  wrapLines("Constantinopolitan", 5),
+  ["Constantinopolitan"],
+  "a word longer than the limit is never chopped in half",
+);
+const anns = [
+  { ...newAnnot("photo", "text", [1, 2], 1) },
+  { ...newAnnot("video", "character", [3, 4], 2) },
+];
+const fc = annotFeatures(anns, ["photo"]);
+assert.equal(fc.features.length, 1, "each layer draws only its own annotations");
+assert.deepEqual(fc.features[0].geometry.coordinates, [1, 2]);
+assert.equal(fc.features[0].properties.id, "an-1");
+assert.equal(annotFeatures(anns, ["video"]).features[0].properties.id, "an-2");
+assert.equal(
+  annotFeatures(anns, ["photo", "video"]).features.length,
+  2,
+  "both layers visible draws both — visibility is separate from which one is active",
+);
+assert.equal(annotFeatures(anns, []).features.length, 0, "hiding both draws nothing");
+
+// --- normaliseCustom: a pasted dataset must not render empty ----------------
+const custom = normaliseCustom(
+  {
+    features: [
+      { properties: { NAME: "Ruritania", start_date: "1500", end_date: "1600" } },
+      { properties: { name: "Syldavia", admin_level: 4 } },
+      { properties: {} },
+    ],
+  },
+  "src-1",
+);
+assert.equal(custom.features[0].properties.name, "Ruritania", "NAME is picked up");
+assert.equal(custom.features[0].properties.admin_level, 2, "a missing level defaults to country");
+assert.equal(custom.features[1].properties.admin_level, 4, "an existing level is preserved");
+assert.equal(custom.features[0].properties.start_num, 1500);
+assert.equal(custom.features[0].properties.end_num, 1600);
+assert.equal(custom.features[1].properties.start_num, -99999, "no date means 'always existed'");
+assert.equal(custom.features[2].properties.osm_id, "src-1-2", "ids are stamped so hover and labels dedupe");
+
+// ===========================================================================
+// Ocean stripping, layer visibility, and the editor's fact fields
+// ===========================================================================
+
+// --- bbox prefilter: what makes ocean stripping affordable ------------------
+assert.deepEqual(bboxOf(sq(1, 2, 5, 9)), [1, 2, 5, 9]);
+assert.equal(bboxOf({ type: "Point", coordinates: [0, 0] }), null);
+assert.ok(boxesOverlap([0, 0, 2, 2], [1, 1, 3, 3]));
+assert.ok(boxesOverlap([0, 0, 2, 2], [2, 2, 4, 4]), "touching counts as overlapping");
+assert.ok(!boxesOverlap([0, 0, 1, 1], [2, 2, 3, 3]));
+const far = { properties: { osm_id: "sea-far" }, geometry: sq(500, 500, 510, 510) };
+const near = { properties: { osm_id: "sea-near" }, geometry: sq(4, 4, 20, 20) };
+assert.deepEqual(
+  nearBox([far, near], [0, 0, 10, 10]).map((f) => f.properties.osm_id),
+  ["sea-near"],
+  "a Pacific polygon is dropped before the clipper ever sees it",
+);
+assert.equal(nearBox([far, near], null).length, 2, "no bbox means no prefilter");
+
+// The sea carves like any other target — the strip does not care what a
+// polygon represents, which is why oceans needed no second code path.
+const coastal = stripGeometry(sq(0, 0, 10, 10), [
+  { properties: { osm_id: "sea-1" }, geometry: sq(6, -1, 11, 11) },
+]);
+assert.equal(featureArea(coastal), 60, "the drawn box now stops at the coastline");
+assert.equal(
+  featureArea(stripGeometry(sq(0, 0, 10, 10), [far])),
+  100,
+  "an ocean polygon nowhere near the shape changes nothing",
+);
+
+// --- annotation layer visibility -------------------------------------------
+const two = [newAnnot("photo", "text", [0, 0], 1), newAnnot("video", "text", [1, 1], 2)];
+assert.equal(annotFeatures(two, ["photo"]).features.length, 1);
+assert.equal(annotFeatures(two, ["photo", "video"]).features.length, 2);
+assert.equal(annotFeatures(two, []).features.length, 0);
+
+// --- wikiTitle: every form people actually paste ----------------------------
+assert.equal(wikiTitle("Kingdom of Bavaria"), "Kingdom of Bavaria");
+assert.equal(wikiTitle("en:Kingdom of Bavaria"), "Kingdom of Bavaria");
+assert.equal(
+  wikiTitle("https://en.wikipedia.org/wiki/Kingdom_of_Bavaria"),
+  "Kingdom of Bavaria",
+  "a pasted URL is decoded and de-underscored",
+);
+assert.equal(
+  wikiTitle("https://de.wikipedia.org/wiki/K%C3%B6nigreich_Bayern"),
+  "Königreich Bayern",
+  "percent-encoding survives",
+);
+assert.equal(
+  wikiTitle("en.wikipedia.org/wiki/France#History"),
+  "France",
+  "a fragment is not part of the title",
+);
+assert.equal(wikiTitle("   "), "");
+
+// --- metaFor / flagOverrides: facts must NOT promote a region ---------------
+// The whole point: correcting a leader leaves the original polygon rendering.
+assert.equal(
+  changesDisplay({ leader: "Ludwig I", flag: "data:image/png;base64,x" }),
+  false,
+  "facts are not display keys, so no amber overlay copy is made",
+);
+assert.deepEqual(
+  excludedIdsOf(
+    { ohm: { overrides: { "7": { props: { leader: "Ludwig I" } } }, added: [] } },
+    "ohm",
+  ),
+  [],
+  "and the original is never hidden — a fact edit must be invisible on the map",
+);
 
 console.log("ok");

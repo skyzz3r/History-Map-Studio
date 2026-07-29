@@ -22,7 +22,9 @@ export default function HierarchyPanel({
   /** Pop to trail index (0 = world view). */
   onJump: (index: number) => void;
   onDrill: (node: Level) => void;
-  onClose: () => void;
+  /** Omitted when the panel is embedded in the sidebar, which owns its own
+   *  header and collapse control — two ✕ buttons on one card read as a bug. */
+  onClose?: () => void;
 }) {
   const spine: Node[] = [
     { key: "world", name: "World", tier: "All polities", depth: 0 },
@@ -44,20 +46,26 @@ export default function HierarchyPanel({
   return (
     <section
       aria-label="Territory hierarchy"
-      className="panel pointer-events-auto flex w-64 flex-col gap-2 overflow-y-auto p-3 text-sm"
+      className={
+        onClose
+          ? "panel pointer-events-auto flex w-64 flex-col gap-2 overflow-y-auto p-3 text-sm"
+          : "flex flex-col gap-2 text-sm"
+      }
     >
-      <div className="flex items-center justify-between">
-        <h2 className="text-xs uppercase tracking-wide text-neutral-500">
-          Hierarchy
-        </h2>
-        <button
-          onClick={onClose}
-          aria-label="Collapse panel"
-          className="rounded px-1 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
-        >
-          ✕
-        </button>
-      </div>
+      {onClose && (
+        <div className="flex items-center justify-between">
+          <h2 className="text-xs uppercase tracking-wide text-neutral-500">
+            Hierarchy
+          </h2>
+          <button
+            onClick={onClose}
+            aria-label="Collapse panel"
+            className="rounded px-1 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       <ol className="flex flex-col">
         {spine.map((n, i) => (

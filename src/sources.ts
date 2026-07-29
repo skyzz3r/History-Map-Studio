@@ -586,7 +586,175 @@ const today: Source = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// User-added border sources
+// ---------------------------------------------------------------------------
+
+/**
+ * A dataset the user pastes in from the settings panel.
+ *
+ * Two shapes cover essentially everything published: a GeoJSON file, and a
+ * vector tileset (an `{z}/{x}/{y}` template or a `pmtiles://` archive), which
+ * additionally needs the name of the layer inside it.
+ */
+export type CustomSource = {
+  id: string;
+  label: string;
+  url: string;
+  kind: "geojson" | "vector";
+  /** Vector only. The layer inside the tileset that holds the boundaries. */
+  sourceLayer?: string;
+  note?: string;
+};
+
+const CUSTOM_SRC_STORE = "sources:custom";
+
+export function savedCustomSources(): CustomSource[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(CUSTOM_SRC_STORE) ?? "[]");
+    return Array.isArray(v)
+      ? v.filter(
+          (c) =>
+            c &&
+            typeof c.id === "string" &&
+            typeof c.url === "string" &&
+            (c.kind === "geojson" || c.kind === "vector"),
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+const writeCustomSources = (list: CustomSource[]) => {
+  localStorage.setItem(CUSTOM_SRC_STORE, JSON.stringify(list));
+  syncCustomSources();
+};
+
+/** Add or replace one. A blank id mints a new, never-colliding one. */
+export function putCustomSource(c: Omit<CustomSource, "id"> & { id?: string }): CustomSource {
+  const list = savedCustomSources();
+  const at = c.id ? list.findIndex((x) => x.id === c.id) : -1;
+  const id =
+    c.id ??
+    `src-${list.reduce((m, x) => Math.max(m, Number(x.id.slice(4)) || 0), 0) + 1}`;
+  const entry: CustomSource = { ...c, id };
+  if (at >= 0) list[at] = entry;
+  else list.push(entry);
+  writeCustomSources(list);
+  return entry;
+}
+
+export const removeCustomSource = (id: string) =>
+  writeCustomSources(savedCustomSources().filter((c) => c.id !== id));
+
+/**
+ * Stamp the fields the shared date and hierarchy filters need.
+ *
+ * Same job as normaliseHB, but non-destructive: a file that already carries
+ * `admin_level` or dates keeps them. Without an admin_level the focus filter
+ * (`>= 1`) rejects every feature and the source renders completely empty —
+ * which is exactly how a perfectly good GeoJSON looks like a broken import.
+ */
+export function normaliseCustom(fc: any, prefix: string): any {
+  let n = 0;
+  for (const f of fc?.features ?? []) {
+    const p = f.properties ?? (f.properties = {});
+    p.name ??= p.NAME ?? p.Name ?? p.title ?? p.label ?? "Unnamed";
+    const lvl = Number(p.admin_level);
+    p.admin_level = Number.isFinite(lvl) && lvl >= 1 ? lvl : COUNTRY_LEVEL;
+    p.osm_id ??= `${prefix}-${n}`;
+    if (p.start_num === undefined)
+      p.start_num = toDecimalYear(p.start_date ?? p.startdate ?? p.from) ?? NO_START;
+    if (p.end_num === undefined)
+      p.end_num = toDecimalYear(p.end_date ?? p.enddate ?? p.to) ?? NO_END;
+    n++;
+  }
+  return fc;
+}
+
+const customData = new Map<string, any>();
+
+/** Turn a saved entry into a real Source. Paint matches the built-ins, so a
+ *  pasted dataset does not look like a different application. */
+export function buildCustomSource(c: CustomSource): Source {
+  const src = `hist-${c.id}`;
+  const fill = `${c.id}-fill`;
+  const line = `${c.id}-line`;
+  return {
+    id: c.id,
+    label: c.label || c.id,
+    note: c.note ?? (c.kind === "vector" ? "Custom vector tiles." : "Custom GeoJSON."),
+    pickLayer: fill,
+    layers: [fill, line],
+    async attach(map, beforeId) {
+      if (c.kind === "vector") {
+        map.addSource(src, {
+          type: "vector",
+          ...(c.url.includes("{z}") ? { tiles: [c.url] } : { url: c.url }),
+          promoteId: "osm_id",
+        } as never);
+      } else {
+        map.addSource(src, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+          promoteId: "osm_id",
+        });
+      }
+      const common = c.kind === "vector" ? { "source-layer": c.sourceLayer ?? "boundaries" } : {};
+      map.addLayer(
+        {
+          id: fill,
+          type: "fill",
+          source: src,
+          ...common,
+          paint: { "fill-color": "#38bdf8", "fill-opacity": fillOpacity() },
+        } as never,
+        beforeId,
+      );
+      map.addLayer(
+        {
+          id: line,
+          type: "line",
+          source: src,
+          ...common,
+          paint: {
+            "line-color": "#bae6fd",
+            "line-width": lineWidth(),
+            "line-opacity": 0.9,
+          },
+        } as never,
+        beforeId,
+      );
+
+      if (c.kind === "vector") return;
+      // Fetched here rather than handed to MapLibre as a data URL, because the
+      // features need normalising before anything can filter them.
+      try {
+        let data = customData.get(c.id);
+        if (!data) {
+          data = normaliseCustom(await (await fetch(c.url)).json(), c.id);
+          customData.set(c.id, data);
+        }
+        (map.getSource(src) as any)?.setData(data);
+      } catch (e) {
+        console.error(`custom source ${c.label} failed to load`, e);
+      }
+    },
+  };
+}
+
+/** Built-ins first, then whatever the user has added. Mutated in place so every
+ *  module that imported SOURCES sees the new list without a reload. */
 export const SOURCES: Source[] = [ohm, hb, cshapes, today];
+const BUILTIN_IDS = new Set(SOURCES.map((s) => s.id));
+
+export function syncCustomSources(): Source[] {
+  for (let i = SOURCES.length - 1; i >= 0; i--)
+    if (!BUILTIN_IDS.has(SOURCES[i].id)) SOURCES.splice(i, 1);
+  for (const c of savedCustomSources()) SOURCES.push(buildCustomSource(c));
+  return SOURCES;
+}
 
 /** The mutually exclusive border datasets — everything that is not an overlay. */
 export const isOverlay = (id: string) =>

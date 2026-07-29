@@ -198,6 +198,28 @@ export function addFeature(src: string, feat: EditFeature) {
   commit();
 }
 
+/**
+ * Replace an ADDED region's geometry — what re-running the border strip does.
+ *
+ * Added regions only, on purpose. Stripping is an operation on a shape the user
+ * drew; reshaping a source polygon would be a different and much larger feature
+ * (the editor changes a region's facts, not its outline — see draw.ts).
+ * Returns false when the id is not one of the user's own regions.
+ */
+export function setAddedGeometry(
+  src: string,
+  id: string | number,
+  geometry: unknown,
+): boolean {
+  const f = bucket(src).added.find(
+    (x) => String(x.properties.osm_id) === String(id),
+  );
+  if (!f) return false;
+  f.geometry = geometry;
+  commit();
+  return true;
+}
+
 export function clearSource(src: string) {
   loadEdits();
   delete doc[src];
@@ -328,6 +350,54 @@ export function editFeatures(src: string): {
     });
   }
   return { type: "FeatureCollection", features };
+}
+
+/**
+ * Facts ABOUT a region, as opposed to facts that change how it draws.
+ *
+ * Deliberately NOT in DISPLAY_KEYS: correcting a leader or pasting a Wikipedia
+ * page must not promote the region into the amber edits overlay. The original
+ * polygon keeps rendering exactly as it did, and the detail card reads these on
+ * top of whatever Wikidata returned.
+ */
+export const META_KEYS = [
+  "wikipedia",
+  "leader",
+  "population",
+  "flag",
+  "arms",
+] as const;
+
+export type Meta = Partial<Record<(typeof META_KEYS)[number], string>>;
+
+/** Whatever the user has asserted about one region. Added regions carry it on
+ *  the feature itself; existing ones carry it in an override. */
+export function metaFor(src: string, id: string | number): Meta {
+  const b = loadEdits()[src];
+  const key = String(id);
+  const from =
+    b?.added.find((f) => String(f.properties.osm_id) === key)?.properties ??
+    b?.overrides[key]?.props;
+  const out: Meta = {};
+  for (const k of META_KEYS) {
+    const v = from?.[k];
+    if (typeof v === "string" && v !== "") out[k] = v;
+  }
+  return out;
+}
+
+/** osm_id -> flag image, for every region the user gave one. The map registers
+ *  these as its own label icons, so a corrected flag shows on the map and not
+ *  only in the detail card. */
+export function flagOverrides(src: string): Map<string, string> {
+  const b = loadEdits()[src];
+  const out = new Map<string, string>();
+  const put = (id: unknown, v: unknown) => {
+    if (typeof v === "string" && v) out.set(String(id), v);
+  };
+  for (const [id, o] of Object.entries(b?.overrides ?? {})) put(id, o.props?.flag);
+  for (const f of b?.added ?? []) put(f.properties.osm_id, f.properties.flag);
+  return out;
 }
 
 /**

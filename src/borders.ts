@@ -74,6 +74,29 @@ export function formatYear(y: number): string {
   return y < 0 ? `${Math.abs(y).toLocaleString()} BC` : `AD ${y}`;
 }
 
+/**
+ * Tick spacing for a timeline window `span` years wide — the 1/2/5 ladder, so
+ * the labels land on years a person would actually name (1800, 1825, 1850) and
+ * never on 1803, 1837, 1871.
+ *
+ * Aims for roughly eight ticks; below one year it stops, since the map's data
+ * has no sub-annual structure worth ruling off.
+ */
+export function niceStep(span: number, target = 8): number {
+  const raw = Math.max(span, 1e-6) / Math.max(target, 1);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const n = raw / mag;
+  const mult = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+  return Math.max(1, mult * mag);
+}
+
+/** The full extent of the time axis, so the timeline cannot be dragged into
+ *  years the data does not reach. */
+export function yearRange(): [number, number] {
+  if (!snapshots.length) return [0, 0];
+  return [snapshots[0].year, snapshots[snapshots.length - 1].year];
+}
+
 // ponytail: plain Map + FIFO evict. An LRU only matters if you thrash >12 eras,
 // which one hand on a slider does not do.
 const cache = new Map<number, unknown>();

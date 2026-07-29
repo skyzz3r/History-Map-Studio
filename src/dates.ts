@@ -51,6 +51,27 @@ export function toInputDate(dec: number): string | null {
   return `${String(year).padStart(4, "0")}-${p(month)}-${p(day)}`;
 }
 
+/**
+ * What the top bar's date box accepts: "1815", "1815-06-18", "44 BC", "-0044",
+ * "AD 800". Returns a decimal year, or null when it is not a date at all.
+ *
+ * One box rather than a `<input type="date">` plus a year field, because the
+ * native element has no year 0 or earlier — and half this map's timeline is BC,
+ * so the control that cannot express it cannot be the only way to jump.
+ */
+export function parseWhen(input: string): number | null {
+  const s = input.trim();
+  if (!s) return null;
+  const bc = /^(\d{1,6})\s*(?:bc|bce)$/i.exec(s);
+  if (bc) return -parseInt(bc[1], 10);
+  const ad = /^(?:ad|ce)\s*(\d{1,6})$/i.exec(s);
+  if (ad) return parseInt(ad[1], 10);
+  // Reject anything that is not purely a signed ISO-ish date, or "12 apples"
+  // would silently jump to the year 12.
+  if (!/^-?\d{1,6}(-\d{1,2}){0,2}$/.test(s)) return null;
+  return toDecimalYear(s);
+}
+
 export function formatDate(dec: number): string {
   const { year, month, day } = fromDecimalYear(dec);
   const md = `${day} ${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][month - 1]}`;

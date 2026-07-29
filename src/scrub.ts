@@ -12,6 +12,17 @@ let labelEl: HTMLElement | null = null;
 let sliderEl: HTMLInputElement | null = null;
 let dateEl: HTMLInputElement | null = null;
 
+/**
+ * Anyone who needs to know the timeline moved — currently the zoomed timeline
+ * strip, which has to re-centre when the date box, a search or a Studio preview
+ * moves time out from under it.
+ */
+const watchers = new Set<(i: number) => void>();
+export function onScrub(fn: (i: number) => void): () => void {
+  watchers.add(fn);
+  return () => watchers.delete(fn);
+}
+
 export const bindLabel = (el: HTMLElement | null) => (labelEl = el);
 export const bindSlider = (el: HTMLInputElement | null) => (sliderEl = el);
 export const bindDate = (el: HTMLInputElement | null) => (dateEl = el);
@@ -46,6 +57,7 @@ export function applyIndex(i: number, moveSlider = false) {
   }
 
   pushOhm(dec);
+  for (const fn of watchers) fn(i);
 
   // The sub-zoom-5 backdrop only. One snapshot, snapped — no crossfade, since
   // two eras at partial opacity showed borders that never coexisted. Nothing

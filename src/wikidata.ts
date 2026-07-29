@@ -218,6 +218,37 @@ export async function lookup(name: string, year: number): Promise<Info> {
   }
 }
 
+const WP_API = "https://en.wikipedia.org/w/api.php";
+
+/**
+ * An article title, however the user pasted it.
+ *
+ * All three of these are things people actually paste into a box labelled
+ * "Wikipedia page": a full URL, the OHM tag's "en:Title" form, and the bare
+ * title. Underscores are the URL form of a space.
+ */
+export function wikiTitle(input: string): string {
+  const s = input.trim();
+  if (!s) return "";
+  const url = /(?:https?:\/\/)?[a-z-]+\.wikipedia\.org\/wiki\/([^?#]+)/i.exec(s);
+  const raw = url ? decodeURIComponent(url[1]) : s.replace(/^[a-z]{2,3}:/i, "");
+  return raw.replace(/_/g, " ").trim();
+}
+
+/** Article title -> Q-id, so a pasted page can fill in the rest of the form. */
+export async function qidForTitle(title: string): Promise<string | undefined> {
+  if (!title) return undefined;
+  const j = await soft(
+    `${WP_API}?action=query&format=json&origin=*&redirects=1` +
+      `&prop=pageprops&ppprop=wikibase_item&titles=${encodeURIComponent(title)}`,
+  );
+  for (const p of Object.values(j?.query?.pages ?? {}) as any[]) {
+    const q = p?.pageprops?.wikibase_item;
+    if (typeof q === "string") return q;
+  }
+  return undefined;
+}
+
 async function label(qid: string): Promise<string | undefined> {
   const v = await soft(`${REST}/${qid}/labels/en`);
   return typeof v === "string" ? v : undefined;

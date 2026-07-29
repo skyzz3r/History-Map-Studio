@@ -43,10 +43,31 @@ datalist {
   border-radius: 3px;
 }
 
+/* MapLibre's own controls are positioned by the map, which fills the window —
+   so without this the scale bar and the attribution sit UNDER the timeline and
+   the sidebar. --tl and --tl's siblings are set on the app shell (App.tsx) and
+   inherit down into #map, so both stay clear as those panels resize. */
+.maplibregl-ctrl-bottom-left {
+  bottom: calc(var(--tl, 7rem) + 0.25rem);
+}
+.maplibregl-ctrl-bottom-right {
+  bottom: calc(var(--tl, 7rem) + 0.25rem);
+  right: var(--rail, 0px);
+}
+
 .maplibregl-ctrl-attrib {
   font-size: 10px;
   background: rgb(23 23 23 / 0.8) !important;
 }
 .maplibregl-ctrl-attrib a {
   color: #a3a3a3;
+}
+
+/* The scale bar ships as dark-on-white, which is unreadable as a hairline over
+   a dark basemap. */
+.maplibregl-ctrl-scale {
+  background: rgb(23 23 23 / 0.85);
+  border-color: rgb(163 163 163 / 0.8);
+  color: #e5e5e5;
+  font-size: 10px;
 }
