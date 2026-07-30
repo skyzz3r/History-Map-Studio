@@ -1049,6 +1049,28 @@ assert.equal(featureArea(split), 80);
 assert.equal(distinctIds([lvl(1, 2, [0, 0, 1, 1]), lvl(1, 2, [2, 2, 3, 3])]), 1,
   "tile pieces of one region count once");
 
+{
+  // The worker path posts a TRIMMED payload — nearBox-filtered, and stripped to
+  // `{geometry}` because names, dates and wikidata tags are most of the bytes
+  // and structured clone charges for all of them (see stripGeometryAsync).
+  //
+  // That trim is only safe while the clipper reads nothing but geometry. If a
+  // future rule here starts consulting a property, this is the assertion that
+  // catches it — otherwise the map would strip correctly on a browser without
+  // workers and wrongly on every other one, which is close to undebuggable.
+  const targets = [
+    { properties: { osm_id: 7, admin_level: 2, name: "Neighbour" }, geometry: sq(5, -1, 11, 11) },
+    { properties: { osm_id: 8, admin_level: 2, name: "Far away" }, geometry: sq(90, 90, 95, 95) },
+  ];
+  const posted = nearBox(targets, [0, 0, 10, 10]).map((f) => ({ geometry: f.geometry }));
+  assert.equal(posted.length, 1, "the far-away region never crosses to the worker");
+  assert.deepEqual(
+    stripGeometry(drawn, posted),
+    stripGeometry(drawn, targets),
+    "the trimmed payload must clip identically to the full feature list",
+  );
+}
+
 // --- hierTree + layout -----------------------------------------------------
 const focusAt: FocusState = {
   trail: [

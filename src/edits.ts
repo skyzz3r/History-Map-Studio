@@ -20,6 +20,7 @@
 // on Historical-Basemaps, which disagrees with it about nearly every border.
 
 import { NO_END, NO_START } from "./sources.ts";
+import { load, set } from "./store.ts";
 
 export type EditProps = {
   osm_id: string | number;
@@ -91,14 +92,23 @@ export function sanitise(raw: unknown): EditsDoc {
   return out;
 }
 
-export function loadEdits(): EditsDoc {
-  if (loaded) return doc;
+/**
+ * Read the saved edits into memory. Awaited once at boot, before the map is
+ * built, so every synchronous reader below still sees a complete document.
+ *
+ * The store moved from localStorage to IndexedDB because a corrected region
+ * carries its whole geometry, and localStorage would stringify all of it
+ * synchronously on every save, on the way to a cap it eventually hits anyway.
+ * See store.ts.
+ */
+export async function hydrateEdits(): Promise<EditsDoc> {
+  doc = (await load(STORE, sanitise)) ?? {};
   loaded = true;
-  try {
-    doc = sanitise(JSON.parse(localStorage.getItem(STORE) ?? "null"));
-  } catch {
-    doc = {};
-  }
+  return doc;
+}
+
+/** The in-memory document. Empty until hydrateEdits() has resolved. */
+export function loadEdits(): EditsDoc {
   return doc;
 }
 
@@ -122,13 +132,15 @@ export const touchEdits = () => {
 };
 
 function commit() {
-  try {
-    localStorage.setItem(STORE, JSON.stringify(doc));
-  } catch (e) {
-    // A full quota must not silently drop the edit from the screen too — the
-    // in-memory doc stays authoritative and the user still sees their work.
-    console.warn("could not persist edits", e);
-  }
+  // Never write back a document we have not read yet: an edit made in the gap
+  // before hydration would persist `{}` over everything the user already had.
+  // In node (the selftest) hydration never runs, so nothing is written at all.
+  if (loaded)
+    set(STORE, doc).catch((e) => {
+      // A failed write must not drop the edit from the screen too — the
+      // in-memory doc stays authoritative and the user still sees their work.
+      console.warn("could not persist edits", e);
+    });
   for (const fn of listeners) fn();
 }
 

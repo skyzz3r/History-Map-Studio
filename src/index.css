@@ -19,6 +19,83 @@ body,
   inset: 0;
 }
 
+/* Retinting FlexLayout, and cutting the hole the map shows through.
+   The class is doubled to win against the library's own stylesheet: both rules
+   target `.flexlayout__layout`, and which one loads last depends on how Vite
+   happens to order an injected import against this file. */
+.flexlayout__layout.flexlayout__layout {
+  /* Transparent, not black — the workspace ROOT is what the map tab reveals.
+     Every tabset and splitter paints its own background over it, so the only
+     place this shows is the hole. */
+  background: transparent;
+  --color-text: #e5e5e5;
+  --color-background: #0a0a0a;
+  --color-base: #0a0a0a;
+  --color-1: #171717;
+  --color-2: #1f1f1f;
+  --color-3: #262626;
+  --color-4: #2e2e2e;
+  --color-5: #3a3a3a;
+  --color-6: #454545;
+  --color-tab-selected-background: #0a0a0a;
+  --color-drag1: #e5e5e5;
+  --color-drag1-background: rgb(229 229 229 / 0.12);
+  --color-focus: #f5f5f5;
+  --font-size: 12px;
+  --font-family: inherit;
+  --splitter-size: 6px;
+  --splitter-active-size: 10px;
+}
+
+/* The Map tab is a HOLE, not a panel: the real map element sits underneath the
+   whole workspace and is positioned to match this tab's box (see Dock.tsx). The
+   tab has to be see-through AND click-through, or the map would be covered by
+   an opaque rectangle that swallows every drag. `pointer-events` is not reset
+   by the wrapper FlexLayout puts inside, so one declaration covers both. */
+/* A tile can be dragged down to 140 px, and the names in this app are long:
+   "OpenHistoricalMap", "Germany-Luxembourg condominium". One unbreakable word
+   wider than the tile gives the whole panel a sideways scrollbar. Breaking
+   inside a word is only allowed when there is nowhere else to break, so this
+   costs nothing at normal widths. */
+.flexlayout__tab {
+  overflow-wrap: anywhere;
+}
+
+/* Form controls carry an intrinsic minimum width — a <select> refuses to go
+   narrower than its longest option — and that minimum, not the layout, is what
+   pushed the editor's field rows past a narrow tile. `w-full` cannot win
+   against it; `min-width: 0` is what lets it. */
+.flexlayout__tab input,
+.flexlayout__tab select {
+  min-width: 0;
+}
+
+.flexlayout__tab:has(.map-hole) {
+  background: transparent;
+  pointer-events: none;
+}
+
+/* The map is layered ABOVE the workspace, not below it.
+   Below was the obvious arrangement and it does not work: FlexLayout renders
+   every tab as an absolutely-positioned sibling of the tabsets, so a tabset's
+   own content box still sits over the hole and eats every click — and no
+   `:has()` can reach the tab from there to make an exception.
+   Above is safe because the map element is sized to the hole EXACTLY, which
+   stops short of the tab strip and every other panel. */
+#map {
+  z-index: 1;
+}
+.workspace {
+  z-index: 0;
+}
+
+/* …except while a tab is being dragged, when the drop outline has to be
+   visible over the map. It only exists during the drag, so this swaps the two
+   for exactly as long as it matters. */
+.workspace:has(.flexlayout__outline_rect, .flexlayout__edge_rect) {
+  z-index: 2;
+}
+
 /* Era ticks from <datalist> would otherwise render as visible text in Chrome. */
 datalist {
   display: none;
@@ -33,6 +110,25 @@ datalist {
   border: 1px solid rgb(64 64 64 / 0.6);
   border-radius: 0.625rem;
 }
+
+/* A docked panel is a TILE, not a card floating over a map.
+   DetailCard, StudioPanel and EditorPanel were all written as floating cards and
+   all carry the same `panel … w-80 max-h-full` shell. Inside a tab that shell is
+   wrong in three ways at once: a card border drawn inside a bordered tile reads
+   as a panel-in-a-panel, the fixed 20rem width leaves the rest of the tile empty
+   however wide the user drags it, and `max-h-full` fights the tile's own
+   scroller. Undoing it HERE fixes every panel at once and keeps each component
+   usable as a floating card anywhere else. */
+.flexlayout__tab .panel {
+  background: transparent;
+  backdrop-filter: none;
+  border: 0;
+  border-radius: 0;
+  width: auto;
+  max-width: 34rem; /* a fact list stretched to 1200px is unreadable */
+}
+/* `max-h-full` and `overflow-y-auto` are kept, not overridden: they are what
+   makes each panel scroll inside its own tile instead of overflowing it. */
 
 /* Keyboard focus was invisible: every control fell back to the UA default, which
    all but disappears on dark translucent glass. One bright, offset ring, shown

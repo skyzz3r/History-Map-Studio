@@ -142,3 +142,62 @@ export function stripGeometry(drawn: any, targets: Feat[]): any | null {
     ? { type: "Polygon", coordinates: result[0] }
     : { type: "MultiPolygon", coordinates: result };
 }
+
+// ---------------------------------------------------------------------------
+// The same thing, off the main thread
+// ---------------------------------------------------------------------------
+//
+// Structured clone is not free, and a naive `postMessage(targets)` is SLOWER
+// than doing the work inline: the ocean set alone is tens of megabytes of
+// GeoJSON, and copying it costs more than the difference it feeds. So the
+// payload is cut twice before it crosses:
+//
+//   * nearBox() first — a bbox test on the main thread, microseconds, and it is
+//     what stripGeometry would apply on the far side anyway.
+//   * geometry only — stripGeometry never reads a property, and the names,
+//     dates and wikidata tags on a few thousand features are most of the bytes.
+//
+// What is left is only the rings that can actually intersect the drawn shape.
+
+let worker: Worker | null = null;
+let seq = 0;
+
+/** Lazily built: constructing a Worker at import time would break the node selftest. */
+function ensureWorker(): Worker | null {
+  if (worker) return worker;
+  if (typeof Worker === "undefined") return null;
+  try {
+    worker = new Worker(new URL("./strip.worker.ts", import.meta.url), { type: "module" });
+  } catch (e) {
+    console.warn("strip worker unavailable, clipping on the main thread", e);
+    return null;
+  }
+  return worker;
+}
+
+/**
+ * `drawn` minus every target, computed in a worker.
+ *
+ * Falls back to the synchronous path when workers are unavailable, so the
+ * editor behaves identically — only the frame rate during the clip differs.
+ */
+export function stripGeometryAsync(drawn: any, targets: Feat[]): Promise<any | null> {
+  const w = ensureWorker();
+  if (!w) return Promise.resolve(stripGeometry(drawn, targets));
+
+  const near = nearBox(targets, bboxOf(drawn)).map((f) => ({ geometry: f.geometry }));
+  const id = ++seq;
+  return new Promise((resolve) => {
+    const done = (e: MessageEvent<any>) => {
+      if (e.data?.id !== id) return; // two draws in flight must not cross wires
+      w.removeEventListener("message", done);
+      if (e.data.error) {
+        console.warn("strip worker failed, keeping the drawn shape", e.data.error);
+        return resolve(drawn);
+      }
+      resolve(e.data.geometry);
+    };
+    w.addEventListener("message", done);
+    w.postMessage({ id, drawn, targets: near });
+  });
+}

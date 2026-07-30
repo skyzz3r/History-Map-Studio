@@ -24,6 +24,7 @@ import {
   type EditProps,
 } from "../edits.ts";
 import { SOURCES } from "../sources.ts";
+import { canUseFiles, openProject, saveProject } from "../store.ts";
 import { readPicture } from "../annot.ts";
 import { getIndex } from "../scrub.ts";
 import { yearAt } from "../borders.ts";
@@ -51,7 +52,9 @@ export default function EditorPanel({
 }: {
   /** Whatever the map last selected in edit mode. */
   picked: Picked | null;
-  onClose: () => void;
+  /** Omitted when docked: the tab's own ✕ closes it, and leaving edit mode is
+   *  what the mode buttons are for. */
+  onClose?: () => void;
 }) {
   const src = currentSourceId();
   const label = SOURCES.find((s) => s.id === src)?.label ?? src;
@@ -154,33 +157,60 @@ export default function EditorPanel({
               means a different thing on each one. */}
           <p className="text-neutral-200">{label}</p>
         </div>
-        <button
-          onClick={onClose}
-          aria-label="Close editor"
-          className="rounded px-1 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
-        >
-          ✕
-        </button>
+        {onClose && (
+          <button
+            onClick={onClose}
+            aria-label="Close editor"
+            className="rounded px-1 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+          >
+            ✕
+          </button>
+        )}
       </div>
 
       <NewRegion flash={flash} />
 
       <div className="flex flex-wrap gap-1.5">
+        {/* Save writes back to the file the user chose, in place, with no
+            second dialog and no trip through the Downloads folder — that is the
+            whole difference between a web page and a document editor. Browsers
+            without the picker (Firefox, Safari) fall through to the download
+            that has always worked. */}
         <button
-          onClick={() => {
-            download(new Blob([exportEdits()], { type: "application/json" }), "json");
-            flash("Exported");
+          onClick={async () => {
+            if (!canUseFiles()) {
+              download(new Blob([exportEdits()], { type: "application/json" }), "json");
+              return flash("Exported");
+            }
+            try {
+              const name = await saveProject(exportEdits(), "history-map-edits.json");
+              if (name) flash(`Saved to ${name}`);
+            } catch (e) {
+              console.error(e);
+              flash("Could not save — nothing was written");
+            }
           }}
           disabled={!total}
           className="rounded-md bg-neutral-800 px-2.5 py-1 text-xs disabled:opacity-40"
         >
-          Export
+          {canUseFiles() ? "Save" : "Export"}
         </button>
         <button
-          onClick={() => file.current?.click()}
+          onClick={async () => {
+            if (!canUseFiles()) return file.current?.click();
+            try {
+              const text = await openProject();
+              if (text === null) return;
+              const n = importEdits(text);
+              flash(n === null ? "Not an edits file" : `Opened ${n} source(s)`);
+            } catch (e) {
+              console.error(e);
+              flash("Could not open that file");
+            }
+          }}
           className="rounded-md bg-neutral-800 px-2.5 py-1 text-xs"
         >
-          Import
+          {canUseFiles() ? "Open" : "Import"}
         </button>
         <button
           onClick={() => {
@@ -243,7 +273,9 @@ export default function EditorPanel({
           {/* Dates drive the whole timeline filter, so they are the edit that
               most often matters — a country that outlived its record, or one
               that should already be gone. */}
-          <div className="flex gap-2">
+          {/* flex-wrap: a pair of fields that will not fit side by side stacks
+          instead of squeezing both into something unreadable. */}
+      <div className="flex flex-wrap gap-2">
             <Field label="Start">
               <input
                 type="date"
@@ -479,7 +511,9 @@ function Facts({
         </div>
       </Field>
 
-      <div className="flex gap-2">
+      {/* flex-wrap: a pair of fields that will not fit side by side stacks
+          instead of squeezing both into something unreadable. */}
+      <div className="flex flex-wrap gap-2">
         <Field label="Leader">
           <input
             value={str("leader")}
@@ -595,7 +629,9 @@ function NewRegion({
         New region
       </span>
 
-      <div className="flex gap-2">
+      {/* flex-wrap: a pair of fields that will not fit side by side stacks
+          instead of squeezing both into something unreadable. */}
+      <div className="flex flex-wrap gap-2">
         <Field label="Level">
           <select
             value={level}
@@ -731,7 +767,11 @@ function Field({
   children: ReactNode;
 }) {
   return (
-    <label className="min-w-0 flex-1">
+    // basis-32 is what makes `flex-wrap` on the rows above actually wrap. With
+    // the default `flex-1` (basis 0) two fields never exceed the row, so they
+    // squeeze to 37 px each instead — narrow enough that the Pick button alone
+    // overflowed. Below 8rem apiece they stack.
+    <label className="min-w-0 flex-1 basis-32">
       <span className="block text-[11px] uppercase tracking-wide text-neutral-500">
         {label}
       </span>

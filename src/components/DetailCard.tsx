@@ -27,7 +27,9 @@ export default function DetailCard({
   onSelect: (p: Picked) => void;
   /** Open the sidebar's hierarchy section on this region. */
   onShowHierarchy: () => void;
-  onClose: () => void;
+  /** Omitted when the card is docked in a tab: the tab has a ✕ of its own, and
+   *  two of them on one card read as a bug. */
+  onClose?: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [more, setMore] = useState(false);
@@ -61,13 +63,15 @@ export default function DetailCard({
         <h2 className="min-w-0 flex-1 text-base font-medium leading-tight">
           {info?.name ?? picked.name}
         </h2>
-        <button
-          onClick={onClose}
-          aria-label="Close details"
-          className="shrink-0 rounded px-1.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100"
-        >
-          ✕
-        </button>
+        {onClose && (
+          <button
+            onClick={onClose}
+            aria-label="Close details"
+            className="shrink-0 rounded px-1.5 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100"
+          >
+            ✕
+          </button>
+        )}
       </div>
 
       {/* Two columns of short facts, so four rows cost two lines rather than

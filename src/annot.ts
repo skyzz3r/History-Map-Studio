@@ -12,6 +12,8 @@
 // instead would have limited the choice to the three Noto weights the Protomaps
 // glyph server happens to host.
 
+import { load, set } from "./store.ts";
+
 export type AnnotLayer = "photo" | "video";
 export type AnnotKind = "text" | "character" | "region";
 
@@ -64,17 +66,26 @@ export const newAnnot = (
 
 const STORE = "annots:v1";
 let list: Annot[] | null = null;
+let hydrated = false;
 const listeners = new Set<() => void>();
 
-export function loadAnnots(): Annot[] {
-  if (list) return list;
-  try {
-    const v = JSON.parse(localStorage.getItem(STORE) ?? "[]");
-    list = Array.isArray(v) ? v.filter(isAnnot) : [];
-  } catch {
-    list = [];
-  }
+/**
+ * Read the saved annotations into memory. Awaited once at boot.
+ *
+ * Pictures are stored as data URLs, so this list is the first thing in the app
+ * to reach the origin's storage quota — which is why it lives in IndexedDB now.
+ * See store.ts.
+ */
+export async function hydrateAnnots(): Promise<Annot[]> {
+  const v = await load(STORE, (raw) => (Array.isArray(raw) ? raw.filter(isAnnot) : []));
+  list = v ?? [];
+  hydrated = true;
   return list;
+}
+
+/** The in-memory list. Empty until hydrateAnnots() has resolved. */
+export function loadAnnots(): Annot[] {
+  return (list ??= []);
 }
 
 const isAnnot = (a: any): a is Annot =>
@@ -86,13 +97,13 @@ export function onAnnotsChange(fn: () => void): () => void {
 }
 
 function commit() {
-  try {
-    localStorage.setItem(STORE, JSON.stringify(list ?? []));
-  } catch (e) {
-    // Pictures are the only thing here big enough to fill the quota. The
-    // in-memory list stays authoritative so the user still sees their work.
+  // Never write before the read: a commit in that gap would persist an empty
+  // list over everything the user already had.
+  if (hydrated)
+    set(STORE, list ?? []).catch((e) => {
+    // The in-memory list stays authoritative so the user still sees their work.
     console.warn("could not persist annotations", e);
-  }
+  });
   for (const fn of listeners) fn();
 }
 

@@ -16,15 +16,7 @@ import { formatYear, indexForYear, niceStep, yearAt, yearRange } from "../border
  * Play is gone. It scrubbed the whole of history at a fixed rate, which is not
  * a thing anyone watches; Studio renders a real fly-through with keyframes.
  */
-export default function Timeline({
-  max,
-  shrunk,
-  onShrink,
-}: {
-  max: number;
-  shrunk: boolean;
-  onShrink: (v: boolean) => void;
-}) {
+export default function Timeline({ max }: { max: number }) {
   const strip = useRef<HTMLDivElement>(null);
   const [span, setSpan] = useState(40);
   const [year, setYear] = useState(() => yearAt(getIndex()));
@@ -51,39 +43,12 @@ export default function Timeline({
 
   const disabled = max <= 0;
 
-  if (shrunk)
-    return (
-      <div className="absolute bottom-0 left-0 z-20 flex h-10 items-center gap-3 pl-4 pr-6"
-           style={{ right: "var(--rail)" }}>
-        <button
-          onClick={() => onShrink(false)}
-          aria-expanded={false}
-          aria-label="Expand the timeline"
-          className="panel px-2.5 py-1 text-xs text-neutral-300 hover:text-neutral-100"
-        >
-          ▲ Timeline
-        </button>
-        <span className="font-mono text-xs tabular-nums text-neutral-400">
-          {formatYear(Math.round(year))}
-        </span>
-      </div>
-    );
-
+  // Shrink and expand are gone: the timeline is a tile now, so its height is a
+  // splitter drag and hiding it is the Window menu. Two ways to make a panel
+  // smaller is one way too many.
   return (
-    <div
-      className="absolute bottom-0 left-0 z-20 bg-gradient-to-t from-neutral-950 via-neutral-950/80 to-transparent px-4 pb-3 pt-8"
-      style={{ right: "var(--rail)" }}
-    >
+    <div className="flex h-full flex-col justify-center px-4 py-2">
       <div className="flex items-end gap-3">
-        <button
-          onClick={() => onShrink(true)}
-          aria-expanded
-          aria-label="Shrink the timeline"
-          className="panel mb-1 shrink-0 px-2.5 py-1 text-xs text-neutral-300 hover:text-neutral-100"
-        >
-          ▼
-        </button>
-
         <div className="min-w-0 flex-1">
           <div
             ref={strip}

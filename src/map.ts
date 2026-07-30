@@ -48,7 +48,7 @@ import {
   visibleLayers,
   type AnnotLayer,
 } from "./annot.ts";
-import { distinctIds, stripGeometry, stripTargets } from "./strip.ts";
+import { distinctIds, stripGeometryAsync, stripTargets } from "./strip.ts";
 import { buildLabelPoints } from "./labels.ts";
 import { bboxArea, claimsFrom, overlappingIds, type Sample } from "./claims.ts";
 import { featureArea, labelPoint } from "./geo.ts";
@@ -114,6 +114,16 @@ let clip = savedClip();
 // ---------------------------------------------------------------------------
 
 export let map: maplibregl.Map;
+
+/**
+ * Tell MapLibre its container changed size.
+ *
+ * The docking layout resizes the map by moving a plain DOM element, which GL
+ * cannot see: without this the drawing buffer keeps the old dimensions and the
+ * map renders stretched into its new box. Safe before initMap, because the
+ * layout reports its first rectangle before the map exists.
+ */
+export const resizeMap = () => map?.resize();
 
 let currentDate = -1e9;
 let enabled: string[] = [];
@@ -2163,7 +2173,7 @@ export async function drawRegion(opts: DrawOpts): Promise<DrawResult | null> {
     // Sea polygons are not "regions" and must not be counted as such — the
     // editor reports how many existing STATES were carved out.
     stripped = distinctIds(targets.filter((f) => !String(f.properties?.osm_id).startsWith("sea-")));
-    const cut = stripGeometry(raw, targets);
+    const cut = await stripGeometryAsync(raw, targets);
     // Nothing left means every square metre drawn already belongs to somebody.
     // Saying so beats saving an empty geometry, which renders as nothing and is
     // indistinguishable from the editor silently failing.
@@ -2208,7 +2218,7 @@ export async function restripRegion(
   );
   if (!feat?.geometry) return null;
   const targets = await stripSet(level, parent, oceans, osmId);
-  const cut = stripGeometry(feat.geometry, targets);
+  const cut = await stripGeometryAsync(feat.geometry, targets);
   if (!cut) return null;
   setAddedGeometry(src, osmId, cut);
   return distinctIds(targets.filter((f) => !String(f.properties?.osm_id).startsWith("sea-")));

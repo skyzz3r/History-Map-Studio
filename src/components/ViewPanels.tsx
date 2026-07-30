@@ -18,41 +18,25 @@ import type { FocusState, Level } from "../focus.ts";
 import HierarchyPanel from "./HierarchyPanel.tsx";
 import HierarchyViz, { type VizView } from "./HierarchyViz.tsx";
 
-type Tab = "list" | VizView;
-
-const TABS: { id: Tab; label: string; title: string }[] = [
-  { id: "list", label: "List", title: "The spine and its subdivisions, as a tree" },
-  { id: "sankey", label: "Sankey", title: "Flow diagram, sized by how much sits under each node" },
-  { id: "radial", label: "Radial", title: "Radial tree — click a node's ring to fold its branch" },
-  { id: "sunburst", label: "Sunburst", title: "Concentric rings, one per level" },
-];
-
 /**
- * Everything about HOW the map is drawn, in one column on the right.
+ * What used to be the right rail, split into the two panels it always was.
  *
- * These controls used to be a floating card that overlapped the map and the
- * detail sheet. A docked rail cannot collide with anything: the map, the
- * timeline and the legend are all laid out against `--rail`, which this sets.
+ * The rail packed "how the map draws" and "what is inside what" into one
+ * scrolling column with a disclosure between them, because there was only one
+ * edge to put them on. In a docking workspace they are separate tabs the user
+ * can size independently — the whole point of the hierarchy views is that they
+ * are worth 60% of the screen sometimes and 0% the rest of the time, and a
+ * fixed 18rem column could never give them that.
+ *
+ * Both fill their tab. No absolute positioning, no z-index, no `--rail`: the
+ * layout engine owns where they are now.
  */
-export default function RightRail({
-  open,
-  onOpen,
-  hierOpen,
-  onHierOpen,
-  focus,
-}: {
-  open: boolean;
-  onOpen: (v: boolean) => void;
-  /** Controlled from App so the detail card's "Show hierarchy" can open it. */
-  hierOpen: boolean;
-  onHierOpen: (v: boolean) => void;
-  focus: FocusState;
-}) {
+
+export function LayersPanel() {
   const [display, setLocal] = useState<Display>(getDisplay);
   const [basemap, setBase] = useState(savedBasemap);
   const [on, setOn] = useState<string[]>(savedSources);
   const [clip, setClipOn] = useState(savedClip);
-  const [tab, setTab] = useState<Tab>("list");
 
   const customs = savedCustomBasemaps();
   const datasets = SOURCES.filter((s) => !s.overlay);
@@ -75,37 +59,8 @@ export default function RightRail({
     void setSources(next);
   };
 
-  if (!open)
-    return (
-      <div className="absolute right-3 top-20 z-20">
-        <button
-          onClick={() => onOpen(true)}
-          aria-expanded={false}
-          aria-label="Show map settings and hierarchy"
-          className="panel px-2 py-2 text-sm text-neutral-300 hover:text-neutral-100"
-        >
-          ☰
-        </button>
-      </div>
-    );
-
   return (
-    <aside
-      aria-label="Map settings and hierarchy"
-      className="absolute bottom-0 right-0 top-16 z-20 flex w-72 flex-col gap-3 overflow-y-auto border-l border-neutral-700/60 bg-neutral-900/90 p-3 text-sm backdrop-blur"
-    >
-      <div className="flex items-center justify-between">
-        <h2 className="text-xs uppercase tracking-wide text-neutral-500">View</h2>
-        <button
-          onClick={() => onOpen(false)}
-          aria-expanded
-          aria-label="Collapse the sidebar"
-          className="rounded px-1 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
-        >
-          ✕
-        </button>
-      </div>
-
+    <div className="flex h-full flex-col gap-3 overflow-y-auto p-3 text-sm">
       <Field label="Basemap">
         <select
           value={basemap}
@@ -147,7 +102,7 @@ export default function RightRail({
                 <span className="min-w-0">
                   <span className="text-neutral-100">{s.label}</span>
                   {s.restricted && (
-                    <span className="ml-1 rounded bg-amber-900/70 px-1 text-[10px] uppercase text-amber-200">
+                    <span className="ml-1 rounded bg-amber-900/70 px-1 text-[10px] uppercase text-amber-100">
                       NC
                     </span>
                   )}
@@ -223,48 +178,52 @@ export default function RightRail({
         <Check checked={display.labelName} onChange={() => put({ labelName: !display.labelName })} label="Name" />
         <Check checked={display.labelDates} onChange={() => put({ labelDates: !display.labelDates })} label="Dates" />
       </Field>
+    </div>
+  );
+}
 
-      <div className="border-t border-neutral-800 pt-2">
-        <button
-          onClick={() => onHierOpen(!hierOpen)}
-          aria-expanded={hierOpen}
-          className="flex w-full items-center justify-between rounded px-1 py-0.5 text-left text-xs uppercase tracking-wide text-neutral-500 hover:text-neutral-300"
-        >
-          <span>Hierarchy</span>
-          <span>{hierOpen ? "▲" : "▼"}</span>
-        </button>
+type Tab = "list" | VizView;
 
-        {hierOpen && (
-          <>
-            <div role="tablist" aria-label="Hierarchy view" className="mt-2 flex gap-0.5 rounded-md bg-neutral-950/60 p-0.5">
-              {TABS.map((t) => (
-                <button
-                  key={t.id}
-                  role="tab"
-                  aria-selected={tab === t.id}
-                  title={t.title}
-                  onClick={() => setTab(t.id)}
-                  className={`flex-1 rounded px-1.5 py-1 text-[11px] ${
-                    tab === t.id
-                      ? "bg-neutral-100 font-medium text-neutral-900"
-                      : "text-neutral-400 hover:text-neutral-100"
-                  }`}
-                >
-                  {t.label}
-                </button>
-              ))}
-            </div>
-            <div className="mt-2">
-              {tab === "list" ? (
-                <HierarchyPanel focus={focus} onJump={drillOut} onDrill={drill} />
-              ) : (
-                <HierarchyViz focus={focus} view={tab} onJump={drillOut} onDrill={drill} />
-              )}
-            </div>
-          </>
+const TABS: { id: Tab; label: string; title: string }[] = [
+  { id: "list", label: "List", title: "The spine and its subdivisions, as a tree" },
+  { id: "sankey", label: "Sankey", title: "Flow diagram, sized by how much sits under each node" },
+  { id: "radial", label: "Radial", title: "Radial tree — click a node's ring to fold its branch" },
+  { id: "sunburst", label: "Sunburst", title: "Concentric rings, one per level" },
+];
+
+export function HierarchyTab({ focus }: { focus: FocusState }) {
+  const [tab, setTab] = useState<Tab>("list");
+
+  return (
+    <div className="flex h-full flex-col gap-2 overflow-hidden p-3 text-sm">
+      <div role="tablist" aria-label="Hierarchy view" className="flex shrink-0 gap-0.5 rounded-md bg-neutral-950/60 p-0.5">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={tab === t.id}
+            title={t.title}
+            onClick={() => setTab(t.id)}
+            className={`flex-1 rounded px-1.5 py-1 text-[11px] ${
+              tab === t.id
+                ? "bg-neutral-100 font-medium text-neutral-900"
+                : "text-neutral-400 hover:text-neutral-100"
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {/* The visualisations size themselves to this box, so giving the tab more
+          room is what makes a sunburst of the British Empire readable. */}
+      <div className="min-h-0 flex-1 overflow-auto">
+        {tab === "list" ? (
+          <HierarchyPanel focus={focus} onJump={drillOut} onDrill={drill} />
+        ) : (
+          <HierarchyViz focus={focus} view={tab} onJump={drillOut} onDrill={drill} />
         )}
       </div>
-    </aside>
+    </div>
   );
 }
 

@@ -1,14 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { loadIndex, yearAt } from "./borders.ts";
 import {
   bindFocusChange,
   currentSourceId,
-  drillInto,
-  drillOut,
   getFocus,
   getScene,
   initMap,
   resetFocus,
+  resizeMap,
   setEditMode,
   setScene,
   setSceneActive,
@@ -19,12 +18,14 @@ import { applyIndex, getIndex } from "./scrub.ts";
 import { lookup, lookupByQid, type Info } from "./wikidata.ts";
 import { cachedTags, enTitleOf, fetchTags, qidOf } from "./ohm.ts";
 import { initialFocus, type FocusState } from "./focus.ts";
-import { metaFor, onEditsChange } from "./edits.ts";
+import { hydrateEdits, metaFor, onEditsChange } from "./edits.ts";
+import { hydrateAnnots } from "./annot.ts";
 import { toggleScene, type Scene } from "./view.ts";
 import type { Key } from "./keyframes.ts";
 import Timeline from "./components/Timeline.tsx";
 import TopBar, { type Mode } from "./components/TopBar.tsx";
-import RightRail from "./components/RightRail.tsx";
+import DockLayout, { useDock, type PanelId, type Rect } from "./components/Dock.tsx";
+import { HierarchyTab, LayersPanel } from "./components/ViewPanels.tsx";
 import DetailCard from "./components/DetailCard.tsx";
 import Legend from "./components/Legend.tsx";
 import SettingsPanel from "./components/SettingsPanel.tsx";
@@ -32,17 +33,18 @@ import StudioPanel from "./components/StudioPanel.tsx";
 import EditorPanel from "./components/EditorPanel.tsx";
 
 /**
- * The screen is divided, not layered.
+ * The screen is tiled, not layered.
  *
- * Every panel owns an edge and nothing floats over anything else: the top bar
- * spans the width, the sidebar is a docked column on the right, the mode panel
- * is a card on the left, and the timeline runs along the bottom between them.
- * Two CSS variables carry the two variable widths — `--rail` for the sidebar
- * and `--tl` for the timeline — so the legend, the scale bar and the
- * attribution can all be laid out against them instead of guessing.
+ * Every panel is a tile in a docking workspace the user can resize, tab
+ * together and close — including the map, which used to be the immovable
+ * background everything else floated over. The one thing that did not move is
+ * the map ELEMENT: it is created here, once, and merely repositioned to
+ * wherever its tile currently is (see Dock.tsx). Putting it inside the layout
+ * tree would remount a GL context on every drag.
  */
 export default function App() {
   const container = useRef<HTMLDivElement>(null);
+  const area = useRef<HTMLDivElement>(null);
   const [count, setCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState<Picked | null>(null);
@@ -50,11 +52,6 @@ export default function App() {
   const [others, setOthers] = useState<Picked[]>([]);
   const [info, setInfo] = useState<Info | null>(null);
   const [mode, setMode] = useState<Mode>("explore");
-  const [railOpen, setRailOpen] = useState(true);
-  /** The sidebar's hierarchy disclosure, held here so the detail card's
-   *  "Show hierarchy" can open it as well as the header inside the rail. */
-  const [hierOpen, setHierOpen] = useState(true);
-  const [tlShrunk, setTlShrunk] = useState(false);
   const [settings, setSettings] = useState(false);
   const [keys, setKeys] = useState<Key[]>([]);
   const [focus, setFocus] = useState<FocusState>(initialFocus);
@@ -73,6 +70,14 @@ export default function App() {
     at: [number, number] | null;
   }>({ p: null, at: null });
 
+  const dock = useDock();
+  const [mapRect, setMapRect] = useState<Rect | null>(null);
+  /** The same box in workspace coordinates, for the overlays that belong to the
+   *  map rather than to the page — the legend follows the map tile now. */
+  const [mapBox, setMapBox] = useState<Rect | null>(null);
+  // Stable, or MapHole tears down and re-observes on every App render.
+  const onMapRect = useCallback((r: Rect | null) => setMapRect(r), []);
+
   /** Clearing the selection returns to the top of the hierarchy. */
   const deselect = () => {
     setPicked(null);
@@ -84,7 +89,10 @@ export default function App() {
     let cancelled = false;
     (async () => {
       try {
-        const snaps = await loadIndex();
+        // Both documents are read before the map is built, because every
+        // synchronous reader below them (excludedIds, editFeatures, the
+        // annotation compositor) assumes a complete document. See store.ts.
+        const [snaps] = await Promise.all([loadIndex(), hydrateEdits(), hydrateAnnots()]);
         if (cancelled) return;
         setCount(snaps.length);
         bindFocusChange(setFocus);
@@ -104,6 +112,34 @@ export default function App() {
       cancelled = true;
     };
   }, []);
+
+  // Glue the map element to its tile. Hidden rather than unmounted when the
+  // tile is gone: closing the Map panel must cost nothing to undo.
+  useEffect(() => {
+    const el = container.current;
+    const host = area.current;
+    if (!el || !host) return;
+    if (!mapRect) {
+      el.style.visibility = "hidden";
+      setMapBox(null);
+      return;
+    }
+    const h = host.getBoundingClientRect();
+    const box = {
+      left: Math.round(mapRect.left - h.left),
+      top: Math.round(mapRect.top - h.top),
+      width: Math.round(mapRect.width),
+      height: Math.round(mapRect.height),
+    };
+    el.style.visibility = "visible";
+    el.style.inset = "auto";
+    el.style.left = `${box.left}px`;
+    el.style.top = `${box.top}px`;
+    el.style.width = `${box.width}px`;
+    el.style.height = `${box.height}px`;
+    setMapBox(box);
+    resizeMap();
+  }, [mapRect]);
 
   // Each mode reroutes what a click MEANS, in map.ts. Leaving a mode clears
   // whatever it had armed, so an old selection cannot be silently acted on.
@@ -127,7 +163,35 @@ export default function App() {
       setPicked(null);
       setOthers([]);
     }
+    // The mode's own panel comes forward with it, and leaves with it. This is
+    // the one place a mode and a tile are tied together: everything else in the
+    // Window menu is the user's to open and close.
+    if (editing) dock.show("edit");
+    else dock.hide("edit");
+    if (studio) dock.show("studio");
+    else dock.hide("studio");
   }, [mode]);
+
+  /**
+   * Closing a tile means what leaving by the front door means.
+   *
+   * The panels lost their own ✕ when they became tiles — the tab has one, and
+   * two on a card read as a bug. But the tab's ✕ only removed the panel: mode
+   * stayed "edit" with no editor on screen, and a selection stayed selected
+   * with nothing showing it. This is the other half of that button.
+   *
+   * Keyed on the CLOSE TRANSITION, not on "is it open": panels are absent for a
+   * frame while they are being opened, and reacting to that would undo the mode
+   * change that opened them.
+   */
+  const wasOpen = useRef<PanelId[]>([]);
+  useEffect(() => {
+    const closed = (id: PanelId) => wasOpen.current.includes(id) && !dock.isOpen(id);
+    if (closed("edit") && mode === "edit") setMode("explore");
+    if (closed("studio") && mode === "studio") setMode("explore");
+    if (closed("details")) deselect();
+    wasOpen.current = dock.open;
+  }, [dock.open]);
 
   // Entity lookup is keyed to the polygon AND the year on screen when it was
   // clicked. The clicked OHM feature has a `wikidata` tag ~90% of the time, so
@@ -171,19 +235,80 @@ export default function App() {
     };
   }, [picked, editRev]);
 
+  // A selection is only worth a panel when there is something selected, so the
+  // Details tile comes forward on a click rather than sitting empty all session.
+  useEffect(() => {
+    if (picked && mode === "explore") dock.show("details");
+  }, [picked]);
+
+  const render = (id: PanelId) => {
+    switch (id) {
+      case "timeline":
+        return <Timeline max={count - 1} />;
+      case "layers":
+        return <LayersPanel />;
+      case "hierarchy":
+        return <HierarchyTab focus={focus} />;
+      // Each panel scrolls itself (`.panel` keeps max-h-full + overflow-y-auto),
+      // so the tile wrapper is a plain full-height box. Padding lives on the
+      // panel too — putting it here as well double-padded every one of them.
+      case "details":
+        return (
+          <div className="h-full">
+            {picked ? (
+              <DetailCard
+                picked={picked}
+                info={info}
+                others={others}
+                // Swapping to an overlapped polity keeps the rest of the stack
+                // available, with the one you just left put back in it.
+                onSelect={(p) => {
+                  setOthers([picked, ...others.filter((o) => o.osmId !== p.osmId)]);
+                  setPicked(p);
+                }}
+                onShowHierarchy={() => dock.show("hierarchy")}
+              />
+            ) : (
+              <p className="p-3 text-xs leading-snug text-neutral-500">
+                Click a territory on the map to see who it was, when it existed
+                and what it belonged to.
+              </p>
+            )}
+          </div>
+        );
+      case "studio":
+        return (
+          <div className="h-full">
+            <StudioPanel
+              keys={keys}
+              setKeys={setKeys}
+              max={count - 1}
+              scene={scene}
+              onScene={setSceneState}
+              picked={studioPick.p}
+              placeAt={studioPick.at}
+            />
+          </div>
+        );
+      case "edit":
+        return (
+          <div className="h-full">
+            <EditorPanel picked={editing} />
+          </div>
+        );
+      default:
+        return null;
+    }
+  };
+
   return (
     <div
-      className="relative h-dvh w-dvw overflow-hidden bg-neutral-950 text-neutral-100"
-      style={
-        {
-          "--rail": railOpen ? "18rem" : "0rem",
-          "--tl": tlShrunk ? "2.5rem" : "7rem",
-        } as React.CSSProperties
-      }
+      className="flex h-dvh w-dvw flex-col overflow-hidden bg-neutral-950 text-neutral-100"
+      // The map has its own tile now, so MapLibre's scale bar and attribution
+      // sit inside it and need no clearance from the timeline or the sidebar.
+      // index.css still reads these, so they are set to zero rather than removed.
+      style={{ "--rail": "0px", "--tl": "0px" } as React.CSSProperties}
     >
-      {/* Sized by #map in index.css, not Tailwind — see the comment there. */}
-      <div ref={container} id="map" />
-
       <TopBar
         mode={mode}
         onMode={setMode}
@@ -193,61 +318,25 @@ export default function App() {
           setOthers([]);
         }}
         error={error}
+        dock={dock}
       />
 
-      <RightRail
-        open={railOpen}
-        onOpen={setRailOpen}
-        hierOpen={hierOpen}
-        onHierOpen={setHierOpen}
-        focus={focus}
-      />
-
-      {/* One card on the left, whatever the mode. Bounded top and bottom so it
-          can never grow under the top bar or the timeline. */}
-      <div
-        className="pointer-events-none absolute left-3 top-16 z-10 flex items-start"
-        // Stops above the scale bar, which shares this corner. 0.75rem cleared
-        // the timeline but ran straight through the scale.
-        style={{ bottom: "calc(var(--tl) + 2.25rem)" }}
-      >
-        {mode === "explore" && picked && (
-          <DetailCard
-            picked={picked}
-            info={info}
-            others={others}
-            // Swapping to an overlapped polity keeps the rest of the stack
-            // available, with the one you just left put back in it.
-            onSelect={(p) => {
-              setOthers([picked, ...others.filter((o) => o.osmId !== p.osmId)]);
-              setPicked(p);
-            }}
-            onShowHierarchy={() => {
-              setRailOpen(true);
-              setHierOpen(true);
-            }}
-            onClose={deselect}
-          />
-        )}
-        {mode === "studio" && (
-          <StudioPanel
-            keys={keys}
-            setKeys={setKeys}
-            max={count - 1}
-            scene={scene}
-            onScene={setSceneState}
-            picked={studioPick.p}
-            placeAt={studioPick.at}
-          />
-        )}
-        {mode === "edit" && (
-          <EditorPanel picked={editing} onClose={() => setMode("explore")} />
+      <div ref={area} className="relative min-h-0 flex-1">
+        {/* Mounted once, for the life of the session. Sized by the effect
+            above, never by the layout engine. */}
+        <div ref={container} id="map" />
+        <div className="workspace absolute inset-0">
+          <DockLayout dock={dock} render={render} onMapRect={onMapRect} />
+        </div>
+        {/* Anchored to the map tile, not the window: the legend explains the
+            map's colours, so it must not drift over the hierarchy panel when
+            the map is squeezed into a corner. */}
+        {mode === "explore" && mapBox && (
+          <div className="pointer-events-none absolute" style={mapBox}>
+            <Legend />
+          </div>
         )}
       </div>
-
-      {mode === "explore" && <Legend />}
-
-      <Timeline max={count - 1} shrunk={tlShrunk} onShrink={setTlShrunk} />
 
       {settings && <SettingsPanel onClose={() => setSettings(false)} />}
     </div>

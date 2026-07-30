@@ -49,7 +49,10 @@ export default function HierarchyPanel({
       className={
         onClose
           ? "panel pointer-events-auto flex w-64 flex-col gap-2 overflow-y-auto p-3 text-sm"
-          : "flex flex-col gap-2 text-sm"
+          : // Docked: fill the tile, and let the children list be the part that
+            // scrolls. min-h-0 is what allows a flex child to shrink below its
+            // content — without it the list pushes the panel past the tile.
+            "flex h-full min-h-0 flex-col gap-2 text-sm"
       }
     >
       {onClose && (
@@ -67,7 +70,7 @@ export default function HierarchyPanel({
         </div>
       )}
 
-      <ol className="flex flex-col">
+      <ol className="flex shrink-0 flex-col">
         {spine.map((n, i) => (
           <li key={n.key} className="flex items-stretch gap-2">
             {/* The connector column: a vertical rail through every node above,
@@ -94,18 +97,20 @@ export default function HierarchyPanel({
       </ol>
 
       {kids.length > 0 && (
-        <div className="flex flex-col">
+        <div className="flex min-h-0 flex-1 flex-col">
           {/* No naive plural "s": the tier names include "State / province",
               which pluralised to "state / provinces". */}
           <p className="pl-6 text-[11px] uppercase tracking-wide text-neutral-500">
             {kids.length} below · {tierName(kids[0].adminLevel)}
           </p>
-          {/* ponytail: 12 shown, the rest is a count. A 200-province list is a
-              scroll bar, not information — drill in to narrow it instead. */}
-          <ul className="max-h-52 overflow-y-auto">
-            {kids.slice(0, 12).map((k, i) => (
+          {/* The 12-item cap and its "+N more" went with the fixed sidebar. A
+              tile whose height the user chose should use it: the list fills
+              what it is given and scrolls past that, instead of hiding twenty
+              members under a count while half the panel sits empty. */}
+          <ul className="min-h-0 flex-1 overflow-y-auto">
+            {kids.map((k, i) => (
               <li key={`${k.osmId}-${i}`} className="flex items-stretch gap-2">
-                <Rail child last={i === Math.min(kids.length, 12) - 1} />
+                <Rail child last={i === kids.length - 1} />
                 <button
                   onClick={() => onDrill(k)}
                   className="my-px min-w-0 flex-1 truncate rounded px-2 py-0.5 text-left text-[13px] text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100"
@@ -115,11 +120,6 @@ export default function HierarchyPanel({
               </li>
             ))}
           </ul>
-          {kids.length > 12 && (
-            <p className="pl-6 text-[11px] text-neutral-400">
-              +{kids.length - 12} more
-            </p>
-          )}
         </div>
       )}
 

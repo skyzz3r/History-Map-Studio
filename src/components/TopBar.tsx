@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { gotoPolity, searchPolities, type Picked } from "../map.ts";
+import { PANELS, type Dock, type PanelId } from "./Dock.tsx";
 import { applyIndex, bindLabel, settle } from "../scrub.ts";
 import { indexForYear } from "../borders.ts";
 import { parseWhen } from "../dates.ts";
@@ -25,6 +26,7 @@ export default function TopBar({
   onSettings,
   onPicked,
   error,
+  dock,
 }: {
   mode: Mode;
   onMode: (m: Mode) => void;
@@ -32,15 +34,18 @@ export default function TopBar({
   /** A search result was chosen — open its detail card. */
   onPicked: (p: Picked) => void;
   error: string | null;
+  dock: Dock;
 }) {
   const label = useRef<HTMLSpanElement>(null);
   useEffect(() => {
     bindLabel(label.current);
   }, []);
 
+  // A row in the flow, not a floating layer: the workspace below gets whatever
+  // height is left, so no panel can ever be hidden under this bar.
   return (
-    <header className="pointer-events-none absolute inset-x-0 top-0 z-30 flex items-center gap-3 p-3">
-      <div className="panel pointer-events-auto flex items-center gap-2 p-1 pl-3">
+    <header className="z-30 flex shrink-0 items-center gap-3 border-b border-neutral-800 bg-neutral-950 p-2">
+      <div className="panel flex items-center gap-2 p-1 pl-3">
         <h1 className="hidden text-sm font-medium tracking-tight lg:block">
           History Map
         </h1>
@@ -64,15 +69,17 @@ export default function TopBar({
         </div>
       </div>
 
+      <WindowMenu dock={dock} onMode={onMode} />
+
       <DateBox labelRef={label} />
 
       {error && (
-        <span className="pointer-events-auto rounded-lg bg-red-950/90 px-3 py-1.5 text-sm text-red-200">
+        <span className="rounded-lg bg-red-950/90 px-3 py-1.5 text-sm text-red-200">
           {error}
         </span>
       )}
 
-      <div className="pointer-events-auto ml-auto flex items-center gap-2">
+      <div className="ml-auto flex items-center gap-2">
         <Search onPicked={onPicked} />
         <button
           onClick={onSettings}
@@ -84,6 +91,78 @@ export default function TopBar({
         </button>
       </div>
     </header>
+  );
+}
+
+/** Panels whose visibility IS a mode — opening them has to switch the mode too,
+ *  or the panel appears and clicking the map still means "tell me about this". */
+const MODE_PANEL: Partial<Record<PanelId, Mode>> = { edit: "edit", studio: "studio" };
+
+/**
+ * Window: every panel, and whether it is on screen.
+ *
+ * A checklist rather than a set of buttons, because the question the user has
+ * is "what am I looking at" and the answer is the ticks. Unticking removes the
+ * tile; ticking puts it back where it belongs — its own corner of the
+ * workspace, not wherever the layout engine felt like dropping it.
+ */
+function WindowMenu({ dock, onMode }: { dock: Dock; onMode: (m: Mode) => void }) {
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const away = (e: PointerEvent) => {
+      if (!box.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", away);
+    return () => document.removeEventListener("pointerdown", away);
+  }, []);
+
+  return (
+    <div ref={box} className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        title="Show or hide panels"
+        className="panel px-3 py-1.5 text-sm text-neutral-300 hover:text-neutral-100"
+      >
+        Window
+      </button>
+      {open && (
+        <div role="menu" className="panel absolute left-0 top-full z-40 mt-1 w-52 p-1 text-sm">
+          {PANELS.map((p) => (
+            <label
+              key={p.id}
+              role="menuitemcheckbox"
+              aria-checked={dock.isOpen(p.id)}
+              className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 hover:bg-neutral-800"
+            >
+              <input
+                type="checkbox"
+                checked={dock.isOpen(p.id)}
+                onChange={() => {
+                  const m = MODE_PANEL[p.id];
+                  if (m) return onMode(dock.isOpen(p.id) ? "explore" : m);
+                  dock.toggle(p.id);
+                }}
+                className="accent-neutral-100"
+              />
+              <span className="text-neutral-100">{p.name}</span>
+            </label>
+          ))}
+          <button
+            onClick={() => {
+              dock.reset();
+              setOpen(false);
+            }}
+            className="mt-1 w-full rounded border-t border-neutral-800 px-2 py-1 pt-1.5 text-left text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100"
+          >
+            Reset layout
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
